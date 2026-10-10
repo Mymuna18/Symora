@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
+import { authConfig, token } from "../tests/report-fixtures.mjs";
 
 const mockSdk = `
 export const Type = {
@@ -51,8 +52,14 @@ const originalApiKey = process.env.GEMINI_API_KEY;
 const originalNodeEnv = process.env.NODE_ENV;
 const originalGeminiModel = process.env.GEMINI_MODEL;
 const originalFallbackModel = process.env.GEMINI_FALLBACK_MODEL;
+const originalDemoAuthEnabled = process.env.SYMORA_DEMO_AUTH_ENABLED;
+const originalDemoParticipants = process.env.SYMORA_DEMO_PARTICIPANTS;
+const testAuthParticipants = JSON.parse(authConfig().participants);
+testAuthParticipants[0].expiresAt = "2099-10-10T13:00:00.000Z";
 process.env.GEMINI_API_KEY = "route-test-only-key";
 process.env.NODE_ENV = "test";
+process.env.SYMORA_DEMO_AUTH_ENABLED = "true";
+process.env.SYMORA_DEMO_PARTICIPANTS = JSON.stringify(testAuthParticipants);
 globalThis.__geminiMock = { text: "", error: null, calls: [] };
 
 const { POST } = await import("../app/api/analyze/route.ts");
@@ -114,6 +121,7 @@ function createRequest(body, headers = {}) {
     method: "POST",
     headers: {
       "x-forwarded-for": `test-client-${++requestNumber}`,
+      authorization: `Bearer ${token}`,
       ...headers,
     },
     body: requestBody,
@@ -317,19 +325,38 @@ try {
     assert.equal(JSON.stringify(payload).includes("private provider"), false);
   });
 
-  await test("production access fails closed even with arbitrary auth-like headers", async () => {
+  await test("production requests with a verified participant token reach Gemini", async () => {
+    process.env.NODE_ENV = "production";
+    setGeminiResponse(validGeminiOutput());
+    const response = await post({
+      language: "es",
+      transcript: "me duele el estómago",
+    });
+    assert.equal(response.status, 200);
+    assert.equal(globalThis.__geminiMock.calls.length, 1);
+    process.env.NODE_ENV = "test";
+  });
+
+  await test("unauthorized production requests are rejected before Gemini", async () => {
     process.env.NODE_ENV = "production";
     setGeminiResponse(validGeminiOutput());
     const response = await post(
-      { language: "es", transcript: "me duele el estómago" },
+      {
+        language: "es",
+        transcript: "me duele el estómago",
+        participantCode: "made-up-participant",
+        role: "coordinator",
+      },
       {
         authorization: "Bearer made-up-token",
         "x-session-token": "made-up-session",
         "x-participant-code": "made-up-participant",
       }
     );
-    await assertErrorResponse(response, 503, "Authentication integration");
+    await assertErrorResponse(response, 401, "Authentication required");
     assert.equal(globalThis.__geminiMock.calls.length, 0);
+    assert.equal(response.headers.get("www-authenticate"), "Bearer");
+    assert.equal(response.headers.get("cache-control"), "no-store");
     process.env.NODE_ENV = "test";
   });
 
@@ -401,6 +428,8 @@ try {
     ["NODE_ENV", originalNodeEnv],
     ["GEMINI_MODEL", originalGeminiModel],
     ["GEMINI_FALLBACK_MODEL", originalFallbackModel],
+    ["SYMORA_DEMO_AUTH_ENABLED", originalDemoAuthEnabled],
+    ["SYMORA_DEMO_PARTICIPANTS", originalDemoParticipants],
   ]) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;

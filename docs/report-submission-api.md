@@ -1,7 +1,8 @@
-# Report submission API — proposed integration contract
+# Report submission API — integration contract
 
-Owner: Elvin. This adds backend submission only. No Gemini, ElevenLabs, frontend,
-coordinator, draft-saving, login, or catalog-management features are implemented.
+Owner: Elvin. This covers participant report submission and Gemini-to-report
+preparation only. It does not implement frontend, ElevenLabs, coordinator,
+draft-saving, login, or catalog-management features.
 
 ## Request
 
@@ -30,6 +31,55 @@ coordinator, draft-saving, login, or catalog-management features are implemented
 
 `headache` is an illustrative code, not a claim that the shared database has that
 entry. The team must agree on the catalog before a live integration test.
+
+## Gemini-to-report preparation
+
+After `POST /api/analyze`, the participant portal can call the authenticated
+`POST /api/reports/prepare` with the original transcript, source, and analysis
+response:
+
+```json
+{
+  "source": "voice",
+  "transcript": "Me duele el estómago desde ayer.",
+  "analysis": {
+    "language": "es",
+    "english_translation": "My stomach has hurt since yesterday.",
+    "symptoms": [
+      {
+        "name": "stomach pain",
+        "onset_text": "yesterday",
+        "intensity": null,
+        "ongoing": null,
+        "source_excerpt": "Me duele el estómago"
+      }
+    ]
+  }
+}
+```
+
+This endpoint authenticates with the same participant bearer token as
+`POST /api/reports` and reads active catalog codes and display names from
+PostgreSQL. It suggests a code only for a unique exact normalized display-name
+match whose source excerpt is found in the submitted transcript. It does not
+use synonyms or fuzzy matching. Unverified excerpts, unknown/ambiguous names,
+and duplicate mappings remain unresolved for participant review. The response
+includes the active catalog for that review.
+
+The draft preserves the original transcript and source excerpt. The report API
+has only one English text field, so `english_translation` is carried as
+`englishSummary`; Gemini's separate `summary` has no independent report column.
+Extracted intensity and onset text are returned only as review candidates:
+they are not converted into numeric intensities or calendar dates. No diagnosis
+or clinical severity is created.
+
+Preparation never submits or marks a report confirmed. Shrinika's portal must
+show the transcript/evidence, translation, extracted symptom details, and any
+unresolved mappings to the participant; allow them to select a code from the
+returned catalog or leave it unresolved; then require an explicit confirmation
+before sending `POST /api/reports` with `confirmed: true`. That endpoint remains
+the only submission path and rejects unconfirmed payloads. The portal must not
+submit while any symptom has no selected catalog code.
 
 - Required: workflowStatus, confirmed, source, originalLanguage,
   originalTranscript, symptoms. This endpoint accepts only `submitted` and
