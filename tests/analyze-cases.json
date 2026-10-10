@@ -1,0 +1,72 @@
+[
+  {
+    "name": "ES basic: two symptoms, shared onset",
+    "language": "es",
+    "transcript": "me duele el estómago y estoy mareado desde el martes",
+    "minSymptoms": 2,
+    "allIntensityNull": true,
+    "onsetAllMatch": "tuesday",
+    "needClarification": true
+  },
+  {
+    "name": "ES colloquial phrasing",
+    "language": "es",
+    "transcript": "Tengo la cabeza como un tambor, no puedo ni abrir los ojos",
+    "minSymptoms": 1,
+    "nameMatch": ["head"],
+    "medsEmpty": true
+  },
+  {
+    "name": "EN vague, missing info",
+    "language": "en",
+    "transcript": "I've been feeling off",
+    "allIntensityNull": true,
+    "allOnsetNull": true,
+    "needClarification": true,
+    "medsEmpty": true
+  },
+  {
+    "name": "ES self-correction (back -> chest)",
+    "language": "es",
+    "transcript": "Me duele la espalda... no, perdón, el pecho, desde ayer",
+    "minSymptoms": 1,
+    "nameMatch": ["chest"],
+    "nameForbid": "back",
+    "onsetAllMatch": "yesterday"
+  },
+  {
+    "name": "ES medication mentioned",
+    "language": "es",
+    "transcript": "Tomé ibuprofeno pero sigue el dolor de cabeza",
+    "minSymptoms": 1,
+    "nameMatch": ["head"],
+    "medsMatch": "ibuprofen",
+    "ongoingAll": true
+  },
+  {
+    "name": "ES mild, no invented severity",
+    "language": "es",
+    "transcript": "Estoy bien, solo un poco cansada",
+    "minSymptoms": 1,
+    "nameMatch": ["tired|fatigue"],
+    "intensityOk": "little|mild|slight|bit",
+    "medsEmpty": true
+  },
+  {
+    "name": "VI: two symptoms, shared onset",
+    "language": "vi",
+    "transcript": "Tôi bị đau bụng và chóng mặt từ thứ Ba",
+    "minSymptoms": 2,
+    "allIntensityNull": true,
+    "onsetAllMatch": "tuesday",
+    "needClarification": true
+  },
+  {
+    "name": "ZH: two symptoms, onset Tuesday",
+    "language": "zh",
+    "transcript": "我从星期二开始肚子疼，还觉得头晕",
+    "minSymptoms": 2,
+    "allIntensityNull": true,
+    "needClarification": true
+  }
+]
