@@ -16,8 +16,13 @@ export class GoogleGenAI {
       generateContent: async (params) => {
         const mock = globalThis.__geminiMock;
         mock.calls.push(params);
-        if (mock.error) throw mock.error;
-        return { text: mock.text };
+        const error = typeof mock.error === "function"
+          ? mock.error(params)
+          : mock.error;
+        if (error) throw error;
+        return {
+          text: typeof mock.text === "function" ? mock.text(params) : mock.text,
+        };
       },
     };
   }
@@ -43,7 +48,11 @@ registerHooks({
 });
 
 const originalApiKey = process.env.GEMINI_API_KEY;
+const originalNodeEnv = process.env.NODE_ENV;
+const originalGeminiModel = process.env.GEMINI_MODEL;
+const originalFallbackModel = process.env.GEMINI_FALLBACK_MODEL;
 process.env.GEMINI_API_KEY = "route-test-only-key";
+process.env.NODE_ENV = "test";
 globalThis.__geminiMock = { text: "", error: null, calls: [] };
 
 const { POST } = await import("../app/api/analyze/route.ts");
@@ -71,6 +80,10 @@ function setGeminiResponse(value) {
     error: null,
     calls: [],
   };
+}
+
+function setGeminiMock({ text = "", error = null }) {
+  globalThis.__geminiMock = { text, error, calls: [] };
 }
 
 function validGeminiOutput() {
@@ -130,6 +143,72 @@ try {
     assert.equal(config.httpOptions.timeout, 10000);
     assert.ok(config.abortSignal instanceof AbortSignal);
     assert.equal(config.abortSignal.aborted, false);
+  });
+
+  await test("English, Vietnamese, and Mandarin responses validate", async () => {
+    const cases = [
+      {
+        language: "en",
+        transcript: "I have a headache",
+        excerpt: "a headache",
+        name: "headache",
+        translation: "I have a headache.",
+        onset: null,
+        participantQuestion: "What makes the headache better?",
+      },
+      {
+        language: "vi",
+        transcript: "Tôi bị đau bụng từ hôm qua",
+        excerpt: "đau bụng",
+        name: "stomach pain",
+        translation: "I have had stomach pain since yesterday.",
+        onset: "yesterday",
+        participantQuestion: "Điều gì làm cơn đau bụng đỡ hơn?",
+      },
+      {
+        language: "zh",
+        transcript: "我从昨天开始头疼",
+        excerpt: "头疼",
+        name: "headache",
+        translation: "I have had a headache since yesterday.",
+        onset: "yesterday",
+        participantQuestion: "什么能缓解头痛？",
+      },
+    ];
+
+    for (const item of cases) {
+      const modelOutput = {
+        language: item.language,
+        english_translation: item.translation,
+        summary: item.translation,
+        symptoms: [{
+          name: item.name,
+          onset_text: item.onset,
+          intensity: null,
+          ongoing: null,
+          source_excerpt: item.excerpt,
+        }],
+        medications_mentioned: [],
+        clarification: {
+          english: "What makes the symptom better?",
+          participant_language: item.participantQuestion,
+        },
+      };
+      setGeminiResponse(modelOutput);
+      const response = await post({
+        language: item.language,
+        transcript: item.transcript,
+      });
+      const payload = await response.json();
+      assert.equal(response.status, 200, item.language);
+      assert.equal(payload.language, item.language);
+      assert.equal(payload.english_translation, item.translation);
+      assert.equal(payload.symptoms[0].name, item.name);
+      assert.equal(payload.symptoms[0].onset_text, item.onset);
+      assert.equal(payload.symptoms[0].verified_excerpt, true);
+      assert.equal(payload.clarification.participant_language, item.participantQuestion);
+      assert.deepEqual(payload.medications_mentioned, []);
+    }
   });
 
   await test("unverified reported symptoms remain in the response", async () => {
@@ -237,11 +316,94 @@ try {
     assert.equal(payload.error, "Analysis processing failed");
     assert.equal(JSON.stringify(payload).includes("private provider"), false);
   });
+
+  await test("production access fails closed even with arbitrary auth-like headers", async () => {
+    process.env.NODE_ENV = "production";
+    setGeminiResponse(validGeminiOutput());
+    const response = await post(
+      { language: "es", transcript: "me duele el estómago" },
+      {
+        authorization: "Bearer made-up-token",
+        "x-session-token": "made-up-session",
+        "x-participant-code": "made-up-participant",
+      }
+    );
+    await assertErrorResponse(response, 503, "Authentication integration");
+    assert.equal(globalThis.__geminiMock.calls.length, 0);
+    process.env.NODE_ENV = "test";
+  });
+
+  await test("retryable primary-model failures proceed to the configured fallback", async () => {
+    process.env.GEMINI_MODEL = "test-primary";
+    process.env.GEMINI_FALLBACK_MODEL = "test-fallback";
+    const output = {
+      language: "en",
+      english_translation: "I have a headache.",
+      summary: "Headache.",
+      symptoms: [{
+        name: "headache",
+        onset_text: null,
+        intensity: null,
+        ongoing: null,
+        source_excerpt: "a headache",
+      }],
+      medications_mentioned: [],
+      clarification: null,
+    };
+    setGeminiMock({
+      error: (params) => {
+        if (params.model === "test-primary") {
+          return Object.assign(new Error("temporary failure"), { status: 503 });
+        }
+        return null;
+      },
+      text: (params) => params.model === "test-fallback" ? JSON.stringify(output) : "",
+    });
+    const response = await post({
+      language: "en",
+      transcript: "I have a headache",
+    });
+    const payload = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(payload.symptoms[0].name, "headache");
+    assert.deepEqual(
+      globalThis.__geminiMock.calls.map((call) => call.model),
+      ["test-primary", "test-primary", "test-primary", "test-fallback"]
+    );
+  });
+
+  await test("untrusted forwarded-for values cannot bypass the shared limiter", async () => {
+    process.env.GEMINI_MODEL = "";
+    process.env.GEMINI_FALLBACK_MODEL = "";
+    setGeminiResponse(validGeminiOutput());
+    const { POST: isolatedPost } = await import("../app/api/analyze/route.ts?rate-limit-test");
+    let lastResponse;
+    for (let index = 0; index < 120; index++) {
+      lastResponse = await isolatedPost(createRequest(
+        { language: "es", transcript: "me duele el estómago" },
+        { "x-forwarded-for": `spoofed-${index}` }
+      ));
+      assert.equal(lastResponse.status, 200);
+    }
+    const blocked = await isolatedPost(createRequest(
+      { language: "es", transcript: "me duele el estómago" },
+      { "x-forwarded-for": "another-spoofed-address" }
+    ));
+    await assertErrorResponse(blocked, 429, "Rate limit");
+  });
 } finally {
   if (originalApiKey === undefined) {
     delete process.env.GEMINI_API_KEY;
   } else {
     process.env.GEMINI_API_KEY = originalApiKey;
+  }
+  for (const [key, value] of [
+    ["NODE_ENV", originalNodeEnv],
+    ["GEMINI_MODEL", originalGeminiModel],
+    ["GEMINI_FALLBACK_MODEL", originalFallbackModel],
+  ]) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
   }
 }
 

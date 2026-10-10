@@ -131,22 +131,22 @@ async function readRequestText(request: Request): Promise<string> {
   return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 }
 
-// Simple in-memory rate limiter store for IP/Session
-const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
-function checkRateLimit(identifier: string): boolean {
+// Per-process global cap only: client IP headers are untrusted here. Coordinate
+// shared, per-user limits with the deployment proxy and Elvin's auth integration.
+const rateLimitWindowMs = 60000;
+const maxRequestsPerWindow = 120;
+let rateLimitCount = 0;
+let rateLimitResetTime = 0;
+function checkRateLimit(): boolean {
   const now = Date.now();
-  const windowMs = 60000; // 1 minute
-  const maxRequests = 20;
-
-  const record = rateLimitMap.get(identifier);
-  if (!record || now > record.resetTime) {
-    rateLimitMap.set(identifier, { count: 1, resetTime: now + windowMs });
-    return true;
+  if (now >= rateLimitResetTime) {
+    rateLimitCount = 0;
+    rateLimitResetTime = now + rateLimitWindowMs;
   }
-  if (record.count >= maxRequests) {
+  if (rateLimitCount >= maxRequestsPerWindow) {
     return false;
   }
-  record.count++;
+  rateLimitCount++;
   return true;
 }
 
@@ -189,7 +189,8 @@ async function generateWithRetry(
               ? err.code
               : undefined;
         const retryable = status === 503 || status === 429 || status === 500;
-        if (!retryable || attempt === 2) throw err;
+        if (!retryable) throw err;
+        if (attempt === 2) break;
         await sleep(800 * 2 ** attempt);
       }
     }
@@ -247,17 +248,15 @@ function isSupportedLanguage(language: unknown): language is SupportedLanguage {
 }
 
 export async function POST(req: Request) {
-  // Rate limiting check
-  const clientIp = req.headers.get("x-forwarded-for") || "anonymous";
-  if (!checkRateLimit(clientIp)) {
-    return NextResponse.json({ error: "Rate limit exceeded" }, { status: 429 });
+  if (process.env.NODE_ENV === "production") {
+    return NextResponse.json(
+      { error: "Authentication integration is not configured" },
+      { status: 503 }
+    );
   }
 
-  // Backend Auth Coordination check (expects Elvin's session/auth header or participant code)
-  const authHeader = req.headers.get("authorization") || req.headers.get("x-session-token");
-  const participantCode = req.headers.get("x-participant-code");
-  if (!authHeader && !participantCode && process.env.NODE_ENV === "production") {
-    // Blocker note: Awaiting final integration of Elvin's shared auth header middleware
+  if (!checkRateLimit()) {
+    return NextResponse.json({ error: "Rate limit exceeded" }, { status: 429 });
   }
 
   let rawText: string;
