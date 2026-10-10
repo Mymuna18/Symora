@@ -16,9 +16,8 @@ async function runTests() {
 
   for (const c of cases) {
     try {
-      // Mocked validation test runner check
       if (!c.transcript || !c.language) {
-        throw new Error("Missing test input");
+        throw new Error("Missing test input fields");
       }
       console.log(`PASS  ${c.name}`);
       passed++;
@@ -29,9 +28,8 @@ async function runTests() {
   }
 
   console.log(`\nResults: ${passed} passed, ${failed} failed`);
-
   if (failed > 0) {
-    process.exit(1); // Non-zero exit code on failure
+    process.exit(1);
   }
 }
 
