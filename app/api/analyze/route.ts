@@ -1,8 +1,6 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { NextResponse } from "next/server";
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
-
 const LANG_NAMES: Record<string, string> = {
   en: "English",
   es: "Spanish",
@@ -56,17 +54,21 @@ RULES:
 - Translate colloquial phrasing faithfully (e.g. "me siento mareado" = "I feel dizzy").
 - clarification: ask ONE short, simple question about the most important missing detail, in English and in the participant's language. null if nothing important is missing.
 - The participant may speak Spanish, Vietnamese, or Mandarin. Write the clarification question's participant_language version in that same language (Simplified Chinese for Mandarin), using simple everyday words.
-- All fields must be in English except source_excerpt (original language) and clarification.participant_language (participant's language).
+- All fields must be in English except source_excerpt (original language) and clarification.participant_language.
 - Do not give medical advice or say anything is serious or not serious.`;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function generateWithRetry(params: any) {
-  const models = [process.env.GEMINI_MODEL!, process.env.GEMINI_FALLBACK_MODEL].filter(
+async function generateWithRetry(ai: any, params: any) {
+  const models = [process.env.GEMINI_MODEL, process.env.GEMINI_FALLBACK_MODEL].filter(
     Boolean
   ) as string[];
-  let lastErr: any;
 
+  if (models.length === 0) {
+    models.push("gemini-2.5-flash"); // Default fallback model
+  }
+
+  let lastErr: any;
   for (const model of models) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
@@ -75,8 +77,8 @@ async function generateWithRetry(params: any) {
         lastErr = err;
         const status = err?.status ?? err?.code;
         const retryable = status === 503 || status === 429 || status === 500;
-        if (!retryable) throw err; // bad key, bad schema, etc.: fail fast
-        await sleep(800 * 2 ** attempt); // 0.8s, 1.6s, 3.2s
+        if (!retryable) throw err;
+        await sleep(800 * 2 ** attempt);
       }
     }
   }
@@ -84,14 +86,46 @@ async function generateWithRetry(params: any) {
 }
 
 export async function POST(req: Request) {
-  const { transcript, language } = await req.json();
-  if (!transcript?.trim()) {
-    return NextResponse.json({ error: "Empty transcript" }, { status: 400 });
+  // Configuration check
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    console.error("ANALYZE ERROR: Missing GEMINI_API_KEY");
+    return NextResponse.json(
+      { error: "Server configuration error: missing API key" },
+      { status: 500 }
+    );
+  }
+
+  // Input validation
+  let body: any;
+  try {
+    body = await req.json();
+  } catch (err) {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  const { transcript, language } = body;
+
+  if (!transcript || typeof transcript !== "string" || !transcript.trim()) {
+    return NextResponse.json(
+      { error: "Transcript is required and must be a non-empty string" },
+      { status: 400 }
+    );
+  }
+
+  if (transcript.length > 5000) {
+    return NextResponse.json(
+      { error: "Transcript exceeds maximum length of 5000 characters" },
+      { status: 400 }
+    );
   }
 
   try {
-    const res = await generateWithRetry({
-      contents: `Participant language: ${LANG_NAMES[language] ?? language}\nTranscript:\n"""${transcript}"""`,
+    const ai = new GoogleGenAI({ apiKey });
+    const targetLang = LANG_NAMES[language] ?? language ?? "English";
+
+    const res = await generateWithRetry(ai, {
+      contents: `Participant language: ${targetLang}\nTranscript:\n"""${transcript}"""`,
       config: {
         systemInstruction: SYSTEM,
         responseMimeType: "application/json",
@@ -100,19 +134,35 @@ export async function POST(req: Request) {
       },
     });
 
-    const analysis = JSON.parse(res.text!);
+    if (!res.text) {
+      throw new Error("Empty response received from Gemini");
+    }
 
-    // Anti-hallucination check: keep only symptoms whose excerpt really appears in the transcript
+    const analysis = JSON.parse(res.text);
+
+    // Anti-hallucination check
     const norm = (s: string) =>
       s.normalize("NFC").toLowerCase().replace(/[\p{P}\p{S}\s]+/gu, "");
     const t = norm(transcript);
-    analysis.symptoms = analysis.symptoms.filter((s: any) =>
-      t.includes(norm(s.source_excerpt))
-    );
 
-    return NextResponse.json({ ...analysis, language, demo_fallback: false });
+    if (Array.isArray(analysis.symptoms)) {
+      analysis.symptoms = analysis.symptoms.filter((s: any) =>
+        s.source_excerpt ? t.includes(norm(s.source_excerpt)) : false
+      );
+    } else {
+      analysis.symptoms = [];
+    }
+
+    return NextResponse.json({
+      ...analysis,
+      language: language || "en",
+      demo_fallback: false,
+    });
   } catch (err: any) {
     console.error("ANALYZE ERROR:", err?.message ?? err);
-    return NextResponse.json({ error: "Analysis failed" }, { status: 502 });
+    return NextResponse.json(
+      { error: "Analysis failed", details: err?.message },
+      { status: 502 }
+    );
   }
 }
