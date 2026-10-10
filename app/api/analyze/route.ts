@@ -1,7 +1,10 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { NextResponse } from "next/server";
 
-const LANG_NAMES: Record<string, string> = {
+const SUPPORTED_LANGUAGES = ["en", "es", "vi", "zh"] as const;
+type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
+
+const LANG_NAMES: Record<SupportedLanguage, string> = {
   en: "English",
   es: "Spanish",
   vi: "Vietnamese",
@@ -59,70 +62,124 @@ RULES:
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+async function fetchWithTimeout(promise: Promise<any>, timeoutMs: number) {
+  let timer: NodeJS.Timeout;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error("Request timed out")), timeoutMs);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+}
+
 async function generateWithRetry(ai: any, params: any) {
   const models = [process.env.GEMINI_MODEL, process.env.GEMINI_FALLBACK_MODEL].filter(
     Boolean
   ) as string[];
 
   if (models.length === 0) {
-    models.push("gemini-2.5-flash"); // Default fallback model
+    models.push("gemini-2.5-flash");
   }
 
   let lastErr: any;
   for (const model of models) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        return await ai.models.generateContent({ ...params, model });
+        return await fetchWithTimeout(ai.models.generateContent({ ...params, model }), 10000);
       } catch (err: any) {
         lastErr = err;
         const status = err?.status ?? err?.code;
         const retryable = status === 503 || status === 429 || status === 500;
         if (!retryable) throw err;
-        await sleep(800 * 2 ** attempt);
+        
+        // Avoid sleeping after the final attempt
+        if (attempt < 2) {
+          await sleep(800 * 2 ** attempt);
+        }
       }
     }
   }
   throw lastErr;
 }
 
-export async function POST(req: Request) {
-  // Configuration check
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    console.error("ANALYZE ERROR: Missing GEMINI_API_KEY");
-    return NextResponse.json(
-      { error: "Server configuration error: missing API key" },
-      { status: 500 }
-    );
+function validateGeminiOutput(analysis: any): boolean {
+  if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) return false;
+  if (typeof analysis.language !== "string") return false;
+  if (typeof analysis.english_translation !== "string") return false;
+  if (typeof analysis.summary !== "string") return false;
+  if (!Array.isArray(analysis.symptoms)) return false;
+  if (!Array.isArray(analysis.medications_mentioned)) return false;
+
+  for (const s of analysis.symptoms) {
+    if (!s || typeof s !== "object" || typeof s.name !== "string" || typeof s.source_excerpt !== "string") {
+      return false;
+    }
   }
 
-  // Input validation
+  if (analysis.clarification !== null && analysis.clarification !== undefined) {
+    if (
+      typeof analysis.clarification !== "object" ||
+      typeof analysis.clarification.english !== "string" ||
+      typeof analysis.clarification.participant_language !== "string"
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+export async function POST(req: Request) {
+  // 1. Enforce payload size limit (max 50KB total body size)
+  const contentLength = req.headers.get("content-length");
+  if (contentLength && parseInt(contentLength, 10) > 51200) {
+    return NextResponse.json({ error: "Payload exceeds 50KB limit" }, { status: 413 });
+  }
+
+  // 2. Configuration Check
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    console.error("ANALYZE ERROR: Missing GEMINI_API_KEY configuration");
+    return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
+  }
+
+  // 3. Strict JSON Body Parsing (Reject null, arrays, non-objects)
   let body: any;
   try {
-    body = await req.json();
-  } catch (err) {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    const rawText = await req.text();
+    if (rawText.length > 51200) {
+      return NextResponse.json({ error: "Payload exceeds size limit" }, { status: 413 });
+    }
+    body = JSON.parse(rawText);
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON payload" }, { status: 400 });
+  }
+
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return NextResponse.json({ error: "Request body must be a JSON object" }, { status: 400 });
   }
 
   const { transcript, language } = body;
 
-  if (!transcript || typeof transcript !== "string" || !transcript.trim()) {
+  // 4. Validate Language
+  if (!language || typeof language !== "string" || !SUPPORTED_LANGUAGES.includes(language as SupportedLanguage)) {
     return NextResponse.json(
-      { error: "Transcript is required and must be a non-empty string" },
+      { error: `Unsupported language. Allowed: ${SUPPORTED_LANGUAGES.join(", ")}` },
       { status: 400 }
     );
   }
 
+  // 5. Validate Transcript
+  if (!transcript || typeof transcript !== "string" || !transcript.trim()) {
+    return NextResponse.json({ error: "Transcript must be a non-empty string" }, { status: 400 });
+  }
+
   if (transcript.length > 5000) {
-    return NextResponse.json(
-      { error: "Transcript exceeds maximum length of 5000 characters" },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "Transcript exceeds maximum length of 5000 characters" }, { status: 400 });
   }
 
   try {
     const ai = new GoogleGenAI({ apiKey });
-    const targetLang = LANG_NAMES[language] ?? language ?? "English";
+    const targetLang = LANG_NAMES[language as SupportedLanguage];
 
     const res = await generateWithRetry(ai, {
       contents: `Participant language: ${targetLang}\nTranscript:\n"""${transcript}"""`,
@@ -135,34 +192,46 @@ export async function POST(req: Request) {
     });
 
     if (!res.text) {
-      throw new Error("Empty response received from Gemini");
+      return NextResponse.json({ error: "Empty analysis generated" }, { status: 502 });
     }
 
-    const analysis = JSON.parse(res.text);
-
-    // Anti-hallucination check
-    const norm = (s: string) =>
-      s.normalize("NFC").toLowerCase().replace(/[\p{P}\p{S}\s]+/gu, "");
-    const t = norm(transcript);
-
-    if (Array.isArray(analysis.symptoms)) {
-      analysis.symptoms = analysis.symptoms.filter((s: any) =>
-        s.source_excerpt ? t.includes(norm(s.source_excerpt)) : false
-      );
-    } else {
-      analysis.symptoms = [];
+    let analysis: any;
+    try {
+      analysis = JSON.parse(res.text);
+    } catch {
+      return NextResponse.json({ error: "Failed to parse analysis structure" }, { status: 502 });
     }
+
+    // 6. Complete Output Runtime Validation
+    if (!validateGeminiOutput(analysis)) {
+      return NextResponse.json({ error: "Analysis failed runtime schema validation" }, { status: 502 });
+    }
+
+    // 7. Verify Excerpts without silent deletion (flag low-confidence items)
+    const norm = (s: string) => s.normalize("NFC").toLowerCase().replace(/[\p{P}\p{S}\s]+/gu, "");
+    const normalizedTranscript = norm(transcript);
+
+    let needsReview = false;
+    analysis.symptoms = analysis.symptoms.map((s: any) => {
+      const excerptMatches = s.source_excerpt ? normalizedTranscript.includes(norm(s.source_excerpt)) : false;
+      if (!excerptMatches) {
+        needsReview = true;
+      }
+      return {
+        ...s,
+        verified_excerpt: excerptMatches,
+      };
+    });
 
     return NextResponse.json({
       ...analysis,
-      language: language || "en",
+      language,
+      requires_manual_review: needsReview,
       demo_fallback: false,
     });
   } catch (err: any) {
-    console.error("ANALYZE ERROR:", err?.message ?? err);
-    return NextResponse.json(
-      { error: "Analysis failed", details: err?.message },
-      { status: 502 }
-    );
+    // Sanitize log: log standard message without credentials or raw transcript
+    console.error("ANALYZE ERROR:", err?.message || "Internal generation failure");
+    return NextResponse.json({ error: "Analysis processing failed" }, { status: 502 });
   }
 }
