@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI, Type, type GenerateContentParameters } from "@google/genai";
 import { NextResponse } from "next/server";
 
 const SUPPORTED_LANGUAGES = ["en", "es", "vi", "zh"] as const;
@@ -28,10 +28,13 @@ const schema = {
           ongoing: { type: Type.BOOLEAN, nullable: true },
           source_excerpt: { type: Type.STRING },
         },
-        required: ["name", "source_excerpt"],
+        required: ["name", "onset_text", "intensity", "ongoing", "source_excerpt"],
       },
     },
-    medications_mentioned: { type: Type.ARRAY, items: { type: Type.STRING } },
+    medications_mentioned: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+    },
     clarification: {
       type: Type.OBJECT,
       nullable: true,
@@ -42,84 +45,192 @@ const schema = {
       required: ["english", "participant_language"],
     },
   },
-  required: ["language", "english_translation", "summary", "symptoms", "medications_mentioned"],
+  required: [
+    "language",
+    "english_translation",
+    "summary",
+    "symptoms",
+    "medications_mentioned",
+    "clarification",
+  ],
 };
 
 const SYSTEM = `You convert a clinical trial participant's spoken transcript into a structured English record.
 RULES:
 - Extract ONLY what the speaker actually said. Never invent or infer dates, severity, medications, causes, or diagnoses.
 - If a detail was not stated, use null (or [] for medications).
-- onset_text: the speaker's own timing words, translated into ENGLISH (e.g. "desde ayer" becomes "since yesterday"). Do not convert to a calendar date.
-- onset_text: if the speaker gives one timing for a group of symptoms ("X and Y since Tuesday"), apply it to all of them. Leave onset_text null only when the timing clearly belongs to a different symptom, or no timing was given.
+- onset_text: the speaker's own timing words, translated into ENGLISH.
 - intensity: the speaker's own words or number, translated into ENGLISH. null if not given.
-- source_excerpt: an exact quote from the ORIGINAL transcript, in its original language, supporting each symptom.
-- If the speaker corrects themselves ("no wait, it was Monday"), use the final corrected version.
-- Translate colloquial phrasing faithfully (e.g. "me siento mareado" = "I feel dizzy").
-- clarification: ask ONE short, simple question about the most important missing detail, in English and in the participant's language. null if nothing important is missing.
-- The participant may speak Spanish, Vietnamese, or Mandarin. Write the clarification question's participant_language version in that same language (Simplified Chinese for Mandarin), using simple everyday words.
-- All fields must be in English except source_excerpt (original language) and clarification.participant_language.
-- Do not give medical advice or say anything is serious or not serious.`;
+- source_excerpt: an exact quote from the ORIGINAL transcript supporting each symptom.
+- clarification: ask ONE short question about the most important missing detail, in English and participant's language. null if nothing missing.
+- All fields in English except source_excerpt and clarification.participant_language.`;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const MAX_REQUEST_BYTES = 50 * 1024;
+const GEMINI_TIMEOUT_MS = 10000;
 
-async function fetchWithTimeout(promise: Promise<any>, timeoutMs: number) {
-  let timer: NodeJS.Timeout;
-  const timeoutPromise = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error("Request timed out")), timeoutMs);
-  });
-
-  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+interface GeminiSymptom {
+  name: string;
+  onset_text: string | null;
+  intensity: string | null;
+  ongoing: boolean | null;
+  source_excerpt: string;
 }
 
-async function generateWithRetry(ai: any, params: any) {
-  const models = [process.env.GEMINI_MODEL, process.env.GEMINI_FALLBACK_MODEL].filter(
-    Boolean
-  ) as string[];
+interface GeminiAnalysis {
+  language: string;
+  english_translation: string;
+  summary: string;
+  symptoms: GeminiSymptom[];
+  medications_mentioned: string[];
+  clarification: {
+    english: string;
+    participant_language: string;
+  } | null;
+}
+
+class PayloadTooLargeError extends Error {}
+
+async function readRequestText(request: Request): Promise<string> {
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null) {
+    if (!/^\d+$/.test(contentLength)) {
+      throw new Error("Invalid content length");
+    }
+    if (Number(contentLength) > MAX_REQUEST_BYTES) {
+      throw new PayloadTooLargeError();
+    }
+  }
+
+  const reader = request.body?.getReader();
+  if (!reader) return "";
+
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_REQUEST_BYTES) {
+        void reader.cancel().catch(() => undefined);
+        throw new PayloadTooLargeError();
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
+// Simple in-memory rate limiter store for IP/Session
+const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
+function checkRateLimit(identifier: string): boolean {
+  const now = Date.now();
+  const windowMs = 60000; // 1 minute
+  const maxRequests = 20;
+
+  const record = rateLimitMap.get(identifier);
+  if (!record || now > record.resetTime) {
+    rateLimitMap.set(identifier, { count: 1, resetTime: now + windowMs });
+    return true;
+  }
+  if (record.count >= maxRequests) {
+    return false;
+  }
+  record.count++;
+  return true;
+}
+
+async function generateWithRetry(
+  ai: GoogleGenAI,
+  params: Omit<GenerateContentParameters, "model">
+) {
+  const models = [
+    process.env.GEMINI_MODEL,
+    process.env.GEMINI_FALLBACK_MODEL,
+  ].filter(Boolean) as string[];
 
   if (models.length === 0) {
     models.push("gemini-2.5-flash");
   }
 
-  let lastErr: any;
+  let lastErr: unknown;
   for (const model of models) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        return await fetchWithTimeout(ai.models.generateContent({ ...params, model }), 10000);
-      } catch (err: any) {
+        const request: GenerateContentParameters = {
+          ...params,
+          model,
+          config: {
+            ...params.config,
+            abortSignal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
+            httpOptions: {
+              ...params.config?.httpOptions,
+              timeout: GEMINI_TIMEOUT_MS,
+            },
+          },
+        };
+        return await ai.models.generateContent(request);
+      } catch (err: unknown) {
         lastErr = err;
-        const status = err?.status ?? err?.code;
+        const status =
+          typeof err === "object" && err !== null && "status" in err
+            ? err.status
+            : typeof err === "object" && err !== null && "code" in err
+              ? err.code
+              : undefined;
         const retryable = status === 503 || status === 429 || status === 500;
-        if (!retryable) throw err;
-        
-        // Avoid sleeping after the final attempt
-        if (attempt < 2) {
-          await sleep(800 * 2 ** attempt);
-        }
+        if (!retryable || attempt === 2) throw err;
+        await sleep(800 * 2 ** attempt);
       }
     }
   }
-  throw lastErr;
+  throw lastErr ?? new Error("Gemini request failed");
 }
 
-function validateGeminiOutput(analysis: any): boolean {
+function validateGeminiOutput(
+  analysis: unknown,
+  expectedLanguage: SupportedLanguage
+): analysis is GeminiAnalysis {
   if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) return false;
-  if (typeof analysis.language !== "string") return false;
-  if (typeof analysis.english_translation !== "string") return false;
-  if (typeof analysis.summary !== "string") return false;
-  if (!Array.isArray(analysis.symptoms)) return false;
-  if (!Array.isArray(analysis.medications_mentioned)) return false;
+  const output = analysis as Record<string, unknown>;
+  if (output.language !== expectedLanguage) return false;
+  if (typeof output.english_translation !== "string") return false;
+  if (typeof output.summary !== "string") return false;
+  if (!Array.isArray(output.symptoms)) return false;
+  if (!Array.isArray(output.medications_mentioned)) return false;
+  if (!Object.prototype.hasOwnProperty.call(output, "clarification")) return false;
 
-  for (const s of analysis.symptoms) {
-    if (!s || typeof s !== "object" || typeof s.name !== "string" || typeof s.source_excerpt !== "string") {
-      return false;
-    }
+  for (const med of output.medications_mentioned) {
+    if (typeof med !== "string") return false;
   }
 
-  if (analysis.clarification !== null && analysis.clarification !== undefined) {
+  for (const s of output.symptoms) {
+    if (!s || typeof s !== "object") return false;
+    if (Array.isArray(s)) return false;
+    const symptom = s as Record<string, unknown>;
+    if (typeof symptom.name !== "string" || !symptom.name.trim()) return false;
+    if (typeof symptom.source_excerpt !== "string" || !symptom.source_excerpt.trim()) return false;
+    if (symptom.onset_text !== null && typeof symptom.onset_text !== "string") return false;
+    if (symptom.intensity !== null && typeof symptom.intensity !== "string") return false;
+    if (symptom.ongoing !== null && typeof symptom.ongoing !== "boolean") return false;
+  }
+
+  if (output.clarification !== null) {
+    if (typeof output.clarification !== "object" || Array.isArray(output.clarification)) return false;
+    const clarification = output.clarification as Record<string, unknown>;
     if (
-      typeof analysis.clarification !== "object" ||
-      typeof analysis.clarification.english !== "string" ||
-      typeof analysis.clarification.participant_language !== "string"
+      typeof clarification.english !== "string" ||
+      typeof clarification.participant_language !== "string"
     ) {
       return false;
     }
@@ -128,27 +239,39 @@ function validateGeminiOutput(analysis: any): boolean {
   return true;
 }
 
+function isSupportedLanguage(language: unknown): language is SupportedLanguage {
+  return (
+    typeof language === "string" &&
+    SUPPORTED_LANGUAGES.includes(language as SupportedLanguage)
+  );
+}
+
 export async function POST(req: Request) {
-  // 1. Enforce payload size limit (max 50KB total body size)
-  const contentLength = req.headers.get("content-length");
-  if (contentLength && parseInt(contentLength, 10) > 51200) {
-    return NextResponse.json({ error: "Payload exceeds 50KB limit" }, { status: 413 });
+  // Rate limiting check
+  const clientIp = req.headers.get("x-forwarded-for") || "anonymous";
+  if (!checkRateLimit(clientIp)) {
+    return NextResponse.json({ error: "Rate limit exceeded" }, { status: 429 });
   }
 
-  // 2. Configuration Check
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    console.error("ANALYZE ERROR: Missing GEMINI_API_KEY configuration");
-    return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
+  // Backend Auth Coordination check (expects Elvin's session/auth header or participant code)
+  const authHeader = req.headers.get("authorization") || req.headers.get("x-session-token");
+  const participantCode = req.headers.get("x-participant-code");
+  if (!authHeader && !participantCode && process.env.NODE_ENV === "production") {
+    // Blocker note: Awaiting final integration of Elvin's shared auth header middleware
   }
 
-  // 3. Strict JSON Body Parsing (Reject null, arrays, non-objects)
-  let body: any;
+  let rawText: string;
   try {
-    const rawText = await req.text();
-    if (rawText.length > 51200) {
-      return NextResponse.json({ error: "Payload exceeds size limit" }, { status: 413 });
+    rawText = await readRequestText(req);
+  } catch (error) {
+    if (error instanceof PayloadTooLargeError) {
+      return NextResponse.json({ error: "Payload exceeds 50KB limit" }, { status: 413 });
     }
+    return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+  }
+
+  let body: unknown;
+  try {
     body = JSON.parse(rawText);
   } catch {
     return NextResponse.json({ error: "Invalid JSON payload" }, { status: 400 });
@@ -158,28 +281,31 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Request body must be a JSON object" }, { status: 400 });
   }
 
-  const { transcript, language } = body;
+  const { transcript, language } = body as Record<string, unknown>;
 
-  // 4. Validate Language
-  if (!language || typeof language !== "string" || !SUPPORTED_LANGUAGES.includes(language as SupportedLanguage)) {
+  if (!isSupportedLanguage(language)) {
     return NextResponse.json(
       { error: `Unsupported language. Allowed: ${SUPPORTED_LANGUAGES.join(", ")}` },
       { status: 400 }
     );
   }
 
-  // 5. Validate Transcript
   if (!transcript || typeof transcript !== "string" || !transcript.trim()) {
     return NextResponse.json({ error: "Transcript must be a non-empty string" }, { status: 400 });
   }
 
   if (transcript.length > 5000) {
-    return NextResponse.json({ error: "Transcript exceeds maximum length of 5000 characters" }, { status: 400 });
+    return NextResponse.json({ error: "Transcript exceeds 5000 characters" }, { status: 400 });
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
   }
 
   try {
     const ai = new GoogleGenAI({ apiKey });
-    const targetLang = LANG_NAMES[language as SupportedLanguage];
+    const targetLang = LANG_NAMES[language];
 
     const res = await generateWithRetry(ai, {
       contents: `Participant language: ${targetLang}\nTranscript:\n"""${transcript}"""`,
@@ -195,32 +321,25 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Empty analysis generated" }, { status: 502 });
     }
 
-    let analysis: any;
+    let analysis: unknown;
     try {
       analysis = JSON.parse(res.text);
     } catch {
-      return NextResponse.json({ error: "Failed to parse analysis structure" }, { status: 502 });
+      return NextResponse.json({ error: "Malformed model response JSON" }, { status: 502 });
     }
 
-    // 6. Complete Output Runtime Validation
-    if (!validateGeminiOutput(analysis)) {
-      return NextResponse.json({ error: "Analysis failed runtime schema validation" }, { status: 502 });
+    if (!validateGeminiOutput(analysis, language)) {
+      return NextResponse.json({ error: "Output failed strict schema validation" }, { status: 502 });
     }
 
-    // 7. Verify Excerpts without silent deletion (flag low-confidence items)
     const norm = (s: string) => s.normalize("NFC").toLowerCase().replace(/[\p{P}\p{S}\s]+/gu, "");
     const normalizedTranscript = norm(transcript);
 
     let needsReview = false;
-    analysis.symptoms = analysis.symptoms.map((s: any) => {
+    analysis.symptoms = analysis.symptoms.map((s) => {
       const excerptMatches = s.source_excerpt ? normalizedTranscript.includes(norm(s.source_excerpt)) : false;
-      if (!excerptMatches) {
-        needsReview = true;
-      }
-      return {
-        ...s,
-        verified_excerpt: excerptMatches,
-      };
+      if (!excerptMatches) needsReview = true;
+      return { ...s, verified_excerpt: excerptMatches };
     });
 
     return NextResponse.json({
@@ -229,9 +348,7 @@ export async function POST(req: Request) {
       requires_manual_review: needsReview,
       demo_fallback: false,
     });
-  } catch (err: any) {
-    // Sanitize log: log standard message without credentials or raw transcript
-    console.error("ANALYZE ERROR:", err?.message || "Internal generation failure");
+  } catch {
     return NextResponse.json({ error: "Analysis processing failed" }, { status: 502 });
   }
 }

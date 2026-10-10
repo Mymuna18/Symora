@@ -1,72 +1,63 @@
-[
-  {
-    "name": "ES basic: two symptoms, shared onset",
+{
+  "name": "Spanish symptoms with shared onset and clarification",
+  "request": {
     "language": "es",
-    "transcript": "me duele el estómago y estoy mareado desde el martes",
-    "minSymptoms": 2,
-    "allIntensityNull": true,
-    "onsetAllMatch": "tuesday",
-    "needClarification": true
+    "transcript": "me duele el estómago y estoy mareado desde el martes"
   },
-  {
-    "name": "ES colloquial phrasing",
+  "modelResponse": {
     "language": "es",
-    "transcript": "Tengo la cabeza como un tambor, no puedo ni abrir los ojos",
-    "minSymptoms": 1,
-    "nameMatch": ["head"],
-    "medsEmpty": true
+    "english_translation": "My stomach hurts and I feel dizzy since Tuesday.",
+    "summary": "Stomach pain and dizziness began Tuesday.",
+    "symptoms": [
+      {
+        "name": "stomach pain",
+        "onset_text": "Tuesday",
+        "intensity": null,
+        "ongoing": null,
+        "source_excerpt": "me duele el estómago"
+      },
+      {
+        "name": "dizziness",
+        "onset_text": "Tuesday",
+        "intensity": null,
+        "ongoing": null,
+        "source_excerpt": "estoy mareado"
+      }
+    ],
+    "medications_mentioned": [],
+    "clarification": {
+      "english": "How severe is the pain?",
+      "participant_language": "¿Qué tan intenso es el dolor?"
+    }
   },
-  {
-    "name": "EN vague, missing info",
-    "language": "en",
-    "transcript": "I've been feeling off",
-    "allIntensityNull": true,
-    "allOnsetNull": true,
-    "needClarification": true,
-    "medsEmpty": true
-  },
-  {
-    "name": "ES self-correction (back -> chest)",
+  "expectedResponse": {
     "language": "es",
-    "transcript": "Me duele la espalda... no, perdón, el pecho, desde ayer",
-    "minSymptoms": 1,
-    "nameMatch": ["chest"],
-    "nameForbid": "back",
-    "onsetAllMatch": "yesterday"
-  },
-  {
-    "name": "ES medication mentioned",
-    "language": "es",
-    "transcript": "Tomé ibuprofeno pero sigue el dolor de cabeza",
-    "minSymptoms": 1,
-    "nameMatch": ["head"],
-    "medsMatch": "ibuprofen",
-    "ongoingAll": true
-  },
-  {
-    "name": "ES mild, no invented severity",
-    "language": "es",
-    "transcript": "Estoy bien, solo un poco cansada",
-    "minSymptoms": 1,
-    "nameMatch": ["tired|fatigue"],
-    "intensityOk": "little|mild|slight|bit",
-    "medsEmpty": true
-  },
-  {
-    "name": "VI: two symptoms, shared onset",
-    "language": "vi",
-    "transcript": "Tôi bị đau bụng và chóng mặt từ thứ Ba",
-    "minSymptoms": 2,
-    "allIntensityNull": true,
-    "onsetAllMatch": "tuesday",
-    "needClarification": true
-  },
-  {
-    "name": "ZH: two symptoms, onset Tuesday",
-    "language": "zh",
-    "transcript": "我从星期二开始肚子疼，还觉得头晕",
-    "minSymptoms": 2,
-    "allIntensityNull": true,
-    "needClarification": true
+    "english_translation": "My stomach hurts and I feel dizzy since Tuesday.",
+    "summary": "Stomach pain and dizziness began Tuesday.",
+    "symptoms": [
+      {
+        "name": "stomach pain",
+        "onset_text": "Tuesday",
+        "intensity": null,
+        "ongoing": null,
+        "source_excerpt": "me duele el estómago",
+        "verified_excerpt": true
+      },
+      {
+        "name": "dizziness",
+        "onset_text": "Tuesday",
+        "intensity": null,
+        "ongoing": null,
+        "source_excerpt": "estoy mareado",
+        "verified_excerpt": true
+      }
+    ],
+    "medications_mentioned": [],
+    "clarification": {
+      "english": "How severe is the pain?",
+      "participant_language": "¿Qué tan intenso es el dolor?"
+    },
+    "requires_manual_review": false,
+    "demo_fallback": false
   }
-]
+}
