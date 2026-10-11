@@ -1,0 +1,63 @@
+{
+  "name": "Spanish symptoms with shared onset and clarification",
+  "request": {
+    "language": "es",
+    "transcript": "me duele el estómago y estoy mareado desde el martes"
+  },
+  "modelResponse": {
+    "language": "es",
+    "english_translation": "My stomach hurts and I feel dizzy since Tuesday.",
+    "summary": "Stomach pain and dizziness began Tuesday.",
+    "symptoms": [
+      {
+        "name": "stomach pain",
+        "onset_text": "Tuesday",
+        "intensity": null,
+        "ongoing": null,
+        "source_excerpt": "me duele el estómago"
+      },
+      {
+        "name": "dizziness",
+        "onset_text": "Tuesday",
+        "intensity": null,
+        "ongoing": null,
+        "source_excerpt": "estoy mareado"
+      }
+    ],
+    "medications_mentioned": [],
+    "clarification": {
+      "english": "How severe is the pain?",
+      "participant_language": "¿Qué tan intenso es el dolor?"
+    }
+  },
+  "expectedResponse": {
+    "language": "es",
+    "english_translation": "My stomach hurts and I feel dizzy since Tuesday.",
+    "summary": "Stomach pain and dizziness began Tuesday.",
+    "symptoms": [
+      {
+        "name": "stomach pain",
+        "onset_text": "Tuesday",
+        "intensity": null,
+        "ongoing": null,
+        "source_excerpt": "me duele el estómago",
+        "verified_excerpt": true
+      },
+      {
+        "name": "dizziness",
+        "onset_text": "Tuesday",
+        "intensity": null,
+        "ongoing": null,
+        "source_excerpt": "estoy mareado",
+        "verified_excerpt": true
+      }
+    ],
+    "medications_mentioned": [],
+    "clarification": {
+      "english": "How severe is the pain?",
+      "participant_language": "¿Qué tan intenso es el dolor?"
+    },
+    "requires_manual_review": false,
+    "demo_fallback": false
+  }
+}
