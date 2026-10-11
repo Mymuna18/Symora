@@ -1,5 +1,5 @@
 import { GoogleGenAI, Type, type GenerateContentParameters } from "@google/genai";
-import { authenticateDemoParticipant } from "../../../lib/demo-auth.mjs";
+import { authenticateParticipantRequest, withPrivateResponse } from "../../../lib/request-auth.mjs";
 import { ReportError } from "../../../lib/report-errors.mjs";
 
 const SUPPORTED_LANGUAGES = ["en", "es", "vi", "zh"] as const;
@@ -320,9 +320,9 @@ function isSupportedLanguage(language: unknown): language is SupportedLanguage {
   );
 }
 
-export async function POST(req: Request) {
+async function analyze(req: Request) {
   try {
-    authenticateDemoParticipant(req);
+    authenticateParticipantRequest(req);
   } catch (error) {
     if (error instanceof ReportError) {
       const unauthorized = error.status === 401;
@@ -445,3 +445,5 @@ export async function POST(req: Request) {
     return Response.json({ error: "Analysis processing failed" }, { status: 502 });
   }
 }
+
+export const POST = withPrivateResponse(analyze);
