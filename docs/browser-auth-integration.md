@@ -3,7 +3,7 @@
 Owner: Elvin. This is the browser integration contract for Shrinika and the
 authentication handoff for Anna. Existing bearer-token clients remain supported;
 browser code must use these session endpoints instead of receiving bearer tokens.
-No frontend, database schema, or provider integration is replaced by this work.
+No frontend or provider integration is replaced by this work.
 
 ## Deployment and configuration
 
@@ -80,6 +80,14 @@ The existing private `DATABASE_URL` and `GEMINI_API_KEY` remain necessary for th
 database and analysis features. This provisioning step neither reads nor changes
 them. No live service or database test is authorized by running the provisioning
 script.
+
+Vercel deployments also require additive migration `002_browser_auth_state.sql`
+before enabling browser auth. It creates `browser_auth_sessions` and
+`rate_limit_buckets`; migration 001 is unchanged. The versioned migration runner
+can preflight 002 with `node scripts/migrate-tigerdata.mjs --migration=002`.
+Applying it requires a separately approved interactive execution using
+`--migration=002 --execute --approve-migration=002` and the runner's exact target
+confirmation. Do not run it as part of app startup or deployment automation.
 
 ## Login, session status, and logout
 
@@ -409,9 +417,11 @@ Authentication error codes are `400 INVALID_LOGIN`, `413 PAYLOAD_TOO_LARGE`,
 `415 UNSUPPORTED_MEDIA_TYPE`, `401 INVALID_CREDENTIALS` (login),
 `401 UNAUTHORIZED` (protected session request), `403 FORBIDDEN` (wrong role),
 `403 CSRF_REJECTED`, `429 LOGIN_RATE_LIMITED`, `503 BROWSER_AUTH_UNAVAILABLE`,
-and `500 AUTH_FAILED`. Login rate limiting returns `Retry-After: 900`; session
-capacity exhaustion also fails closed with `503`. Logout with a missing or
-invalid cookie still clears it and returns `204` after passing CSRF checks.
+and `500 AUTH_FAILED`. Login rate limiting returns `Retry-After: 900`. A database
+outage fails closed: browser-session checks, login, logout revocation, and shared
+rate limiting return `503`; bearer-token authentication remains independent.
+Logout with a missing or invalid cookie still clears it and returns `204` after
+passing CSRF checks.
 
 ## Anna's future transcription endpoint
 
@@ -429,17 +439,25 @@ contract separately.
 
 ## Demo limitations and handoff checklist
 
-Sessions and login limits use shared **process-local memory**, not a database.
-Restarting the process signs out everyone. Multiple Node processes, serverless
-instances, or independently running replicas are unsupported: they do not share
-session/revocation state or aggregate rate limits. Deploy one persistent Node
-process for this demo. A shared session/rate-limit store is separate work.
+Browser sessions and login/analysis rate buckets are stored in TigerData, so
+revocation and fixed-window counters are shared across Vercel instances. Session
+cookies remain signed locally; each cookie-authenticated request also checks its
+hashed session ID and current account-configuration fingerprint in PostgreSQL.
+Session identifiers and account/bucket identifiers are stored only as hashes.
+Expired rows are cleaned up opportunistically in bounded batches during login;
+expiration checks do not depend on cleanup.
 
-Limits are 30 login attempts per minute globally, five per account per 15 minutes
-(including successes), at most four concurrent password checks, and at most
-1,000 active sessions. They reduce demo abuse; they are not distributed production
-abuse prevention. Password reset, MFA, registration, trial-scoped permissions,
-and automatic credential delivery are outside this milestone.
+Limits remain 30 login attempts per minute globally, five per configured account
+per 15 minutes (including successes), at most four concurrent password checks
+per Node process, and 120 analysis requests per minute globally. The concurrency
+and fixed-window limits have per-instance/boundary tradeoffs and are demo abuse
+controls, not complete production abuse prevention. Database failures intentionally
+make browser auth and analysis unavailable rather than falling back to per-instance
+state. Use TigerData's pooled connection endpoint; each warm Vercel instance caps
+its PostgreSQL pool at two clients and database statements at five seconds, so
+aggregate connections still depend on active instance count. Password reset, MFA,
+registration, trial-scoped permissions, and automatic credential delivery are
+outside this milestone.
 
 Configured participant UUIDs must already identify approved fictional active
 participants. Login/analyze/prepare do not query participant status; submission
