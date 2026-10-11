@@ -1,8 +1,8 @@
 # Coordinator review and participant follow-up API
 
-These endpoints reuse the existing `reports` and `review_history` tables; no
-migration or additional service is required. Coordinator identity and participant
-identity come from `authenticateCoordinatorRequest` and
+Coordinator status updates reuse the existing `reports` and `review_history`
+tables. Participant responses and daily reminder de-duplication require additive
+migration 003. Coordinator identity and participant identity come from `authenticateCoordinatorRequest` and
 `authenticateParticipantRequest`, respectively. Both signed browser sessions and
 the existing valid bearer-token clients remain supported.
 
@@ -112,8 +112,9 @@ Errors use `{"error":{"code":"...","message":"..."}}`:
 
 ## Participant follow-up messages
 
-`GET /api/participant/notifications` returns at most the 100 newest follow-up
-messages for the authenticated participant. The query joins reports to the
+`GET /api/participant/notifications` returns up to 100 newest notification events
+for the authenticated participant: reviewed events, saved follow-up requests,
+and the current day's in-app reminder when due. The query joins reports to the
 participant ID obtained from authentication; clients cannot supply a participant
 ID to select another participant's records.
 
@@ -124,8 +125,27 @@ Example:
   "notifications":[{
     "notificationId":"44444444-4444-4444-8444-444444444444",
     "reportId":"22222222-2222-4222-8222-222222222222",
+    "message":"Your symptom report has been reviewed by the study team. Thank you for submitting your report.",
+    "createdAt":"2026-10-11T09:00:00.000Z",
+    "notificationType":"reviewed",
+    "participantResponse":null,
+    "responseUpdatedAt":null
+  },{
+    "notificationId":"55555555-5555-4555-8555-555555555555",
+    "reportId":"22222222-2222-4222-8222-222222222222",
     "message":"Please clarify when your headache began.",
-    "createdAt":"2026-10-11T09:00:00.000Z"
+    "createdAt":"2026-10-12T09:00:00.000Z",
+    "notificationType":"follow_up_requested",
+    "participantResponse":"will_schedule_later",
+    "responseUpdatedAt":"2026-10-12T10:00:00.000Z"
+  },{
+    "notificationId":"reminder:22222222-2222-4222-8222-222222222222:2026-10-13",
+    "reportId":"22222222-2222-4222-8222-222222222222",
+    "message":"Reminder: Please schedule your follow-up appointment with the study team.",
+    "createdAt":"2026-10-13T00:00:00.000Z",
+    "notificationType":"follow_up_reminder",
+    "participantResponse":"will_schedule_later",
+    "responseUpdatedAt":"2026-10-12T10:00:00.000Z"
   }]
 }
 ```
@@ -146,12 +166,88 @@ if (!response.ok) {
 }
 ```
 
-Messages become visible when the participant dashboard fetches this endpoint,
-for example on page load or refresh. The backend does not push updates and the
-frontend does not need polling; a participant who already has the page open will
-see a new message on the next fetch/refresh. No email/SMS delivery, read receipt,
-or notification acknowledgement is implemented. The response excludes reviewer
+The participant page fetches on verified login and whenever the Notification
+Center opens. Messages become visible on that fetch or a refresh; no polling or
+push delivery is used. Daily reminders use UTC calendar dates, are inserted
+idempotently at most once per report per day, and begin the day after the
+participant records `will_schedule_later`. They are shown only when the
+participant next opens or refreshes the Notification Center. No email, SMS,
+background delivery, read receipt, or notification acknowledgement is
+implemented. Reviewed-message copy confirms only that a review occurred; it does
+not imply medical clearance or health status. The response excludes reviewer
 identity and unrelated report/participant details.
+
+### Participant follow-up response
+
+`POST /api/participant/follow-up-response` accepts exactly a report ID and the
+participant's self-reported choice. It requires the authenticated participant
+session (or existing supported bearer credential). Cookie-authenticated requests
+must include `X-Symora-CSRF: 1`; the server validates the request Origin.
+
+```json
+{"reportId":"22222222-2222-4222-8222-222222222222","response":"will_schedule_later"}
+```
+
+or:
+
+```json
+{"reportId":"22222222-2222-4222-8222-222222222222","response":"appointment_scheduled"}
+```
+
+The response is `{"reportId":"...","response":"appointment_scheduled","respondedAt":"2026-10-13T10:00:00.000Z"}`.
+Repeated identical submissions are idempotent. A saved `will_schedule_later`
+choice can be changed to `appointment_scheduled`; a completed choice cannot be
+reverted. The report must belong to the authenticated participant and have a
+persisted follow-up request. “Appointment Scheduled” records only the
+participant's statement; Symora does not book or create calendar events.
+
+```js
+const response = await fetch("/api/participant/follow-up-response", {
+  method: "POST",
+  credentials: "same-origin",
+  cache: "no-store",
+  headers: {
+    "Content-Type": "application/json",
+    "X-Symora-CSRF": "1",
+  },
+  body: JSON.stringify({ reportId, response: "appointment_scheduled" }),
+});
+const data = await response.json();
+if (!response.ok) {
+  showResponseError(data.error?.message ?? "Your response could not be saved.");
+} else {
+  // Refresh the Notification Center only after the server confirms the save.
+  await loadNotifications();
+}
+```
+
+Errors use `{"error":{"code":"...","message":"..."}}`: `400 INVALID_RESPONSE`,
+`401 UNAUTHORIZED`, `403 FORBIDDEN`/`403 CSRF_REJECTED`, `404 REPORT_NOT_FOUND`,
+`409 FOLLOW_UP_NOT_FOUND`, `409 FOLLOW_UP_ALREADY_COMPLETED`, `413
+PAYLOAD_TOO_LARGE`, `415 UNSUPPORTED_MEDIA_TYPE`, `503
+FOLLOW_UP_RESPONSE_UNAVAILABLE`, and `500 INTERNAL_ERROR`.
+
+### Migration 003
+
+Apply `db/migrations/003_participant_follow_up_responses.sql` only after explicit
+database-migration approval. It adds participant response state and daily
+reminder event tables, with a unique `(report_id, reminder_date)` key to prevent
+duplicate reminders. The runner verifies the existing 001 and 002 schema before
+preflight or execution. Preflight remains read-only:
+
+```sh
+node --env-file=.env.local scripts/migrate-tigerdata.mjs --migration=003 --preflight
+```
+
+After separate approval only, execution requires both flags and an interactive
+confirmation of `APPLY SYMORA 003 TO tsdb.public`:
+
+```sh
+node --env-file=.env.local scripts/migrate-tigerdata.mjs --migration=003 --execute --approve-migration=003
+```
+
+Migration SHA-256:
+`da3893a28c406eda97a5abf6a960ab8b30cf4f6b4b7583f7c60a7bdb44b421a0`.
 
 Errors use the same JSON shape: `401 UNAUTHORIZED`,
 `403 FORBIDDEN`/`403 CSRF_REJECTED` (role/session failure), `503
