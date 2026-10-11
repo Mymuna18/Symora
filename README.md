@@ -6,9 +6,6 @@
 
 Built at **HackRU 2026**, Symora helps participants describe symptoms in their preferred language, uses AI to organize that information into structured English reports, and gives research teams a dashboard to review submissions and manage follow-ups.
 
-**Live Website:** https://symora-one.vercel.app
-
-**Interactive Demo:** https://symora-one.vercel.app/demo
 
 > **Note:** The public Demo Mode is a simulated, browser-only experience. The authenticated application uses the real ElevenLabs, Gemini, and TigerData integrations.
 
