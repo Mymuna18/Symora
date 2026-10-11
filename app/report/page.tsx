@@ -1,29 +1,20 @@
 "use client";
 
 import { BrandHeader } from "@/components/ui/BrandHeader";
-import { startTransition, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ApiError,
   analyzeReport,
   getBrowserSession,
+  getParticipantNotifications,
   logoutBrowserSession,
   prepareReport,
+  saveParticipantFollowUpResponse,
   submitReport,
+  type ParticipantNotification,
+  type ParticipantFollowUpResponse,
 } from "@/lib/frontend-api";
-import {
-  appendChatMessage,
-  clearParticipantChatData,
-  dailyChatKey,
-  readFollowUpState,
-  readChatMessages,
-  subscribeToFollowUpState,
-  subscribeToChatMessages,
-  writeChatMessages,
-  writeFollowUpState,
-  type ChatMessage,
-  type FollowUpState,
-} from "@/lib/chat";
 import { MicHero } from "@/components/ui/MicHero";
 import {
   ParticipantReportReview,
@@ -43,12 +34,6 @@ type Flow = "idle" | "review" | "done";
 
 // Fictional placeholder for the demo
 const STUDY_TEAM_PHONE = "[study team number]";
-const DEMO_PARTICIPANT_CODE = "DEMO-014";
-const noFollowUp: FollowUpState = {
-  pending: false,
-  appointmentScheduled: false,
-  lastReminderDate: null,
-};
 
 const langOptions: { code: Language; label: string }[] = [
   { code: "en", label: "English" },
@@ -56,6 +41,19 @@ const langOptions: { code: Language; label: string }[] = [
   { code: "zh", label: "中文（普通话）" },
   { code: "vi", label: "Tiếng Việt" },
 ];
+const dateLocales: Record<Language, string> = {
+  en: "en-US",
+  es: "es",
+  zh: "zh-CN",
+  vi: "vi-VN",
+};
+
+function formatNotificationTimestamp(value: string, language: Language) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleString(dateLocales[language], { dateStyle: "medium", timeStyle: "short" });
+}
 
 const copy: Record<Language, {
   tabs: Record<Tab, string>;
@@ -81,18 +79,20 @@ const copy: Record<Language, {
   savedTag: string;
   chatTitle: string;
   careTeam: string;
-  you: string;
-  automatedMessage: string;
   chatEmpty: string;
   chatDemoNotice: string;
+  notificationsLoading: string;
+  notificationsError: string;
+  retry: string;
+  appointmentScheduled: string;
+  scheduleLater: string;
+  appointmentReported: string;
+  laterReported: string;
+  responseSaving: string;
+  responseSaveError: string;
   openChat: string;
   closeChat: string;
-  unreadMessages: string;
-  reviewedMessage: string;
-  followUpMessage: string;
-  followUpReminder: string;
-  appointmentScheduled: string;
-  willScheduleLater: string;
+  notificationCount: string;
   reviewTitle: string;
   translatedReport: string;
   summary: string;
@@ -157,18 +157,20 @@ const copy: Record<Language, {
     savedTag: "✓ Saved",
     chatTitle: "Notification Center",
     careTeam: "Your doctor or coordinator",
-    you: "You",
-    automatedMessage: "Automated message",
     chatEmpty: "No notifications yet.",
-    chatDemoNotice: "Demo only. Messages are not secure and are not for emergencies.",
+    chatDemoNotice: "In-app messages are not emergency alerts.",
+    notificationsLoading: "Loading notifications…",
+    notificationsError: "Notifications could not be loaded.",
+    retry: "Try again",
+    appointmentScheduled: "Appointment Scheduled",
+    scheduleLater: "Understood, Will Schedule Appointment Later",
+    appointmentReported: "You reported that you scheduled a follow-up appointment. Symora did not book an appointment.",
+    laterReported: "You asked to be reminded to schedule your follow-up appointment.",
+    responseSaving: "Saving your response…",
+    responseSaveError: "Your response could not be saved. Please try again.",
     openChat: "Open Notification Center",
     closeChat: "Close Notification Center",
-    unreadMessages: "unread notifications",
-    reviewedMessage: "Your doctor has reviewed your symptom report. Thank you for sharing how you are feeling.",
-    followUpMessage: "Your doctor would like to follow up with you about your report. Please contact your doctor to schedule an appointment. If it is an emergency, call 911.",
-    followUpReminder: "Reminder: Please contact your doctor to schedule a follow-up about your report. If it is an emergency, call 911.",
-    appointmentScheduled: "Appointment Scheduled",
-    willScheduleLater: "Understood, Will Schedule Later",
+    notificationCount: "notifications",
     reviewTitle: "Review your report",
     translatedReport: "English translation",
     summary: "Analysis summary",
@@ -233,18 +235,20 @@ const copy: Record<Language, {
     savedTag: "✓ Guardado",
     chatTitle: "Centro de notificaciones",
     careTeam: "Tu médico o coordinador",
-    you: "Tú",
-    automatedMessage: "Mensaje automático",
     chatEmpty: "Aún no hay notificaciones.",
-    chatDemoNotice: "Solo demostración. Los mensajes no son seguros ni para emergencias.",
+    chatDemoNotice: "Los mensajes de la aplicación no son alertas de emergencia.",
+    notificationsLoading: "Cargando notificaciones…",
+    notificationsError: "No se pudieron cargar las notificaciones.",
+    retry: "Intentar de nuevo",
+    appointmentScheduled: "Cita programada",
+    scheduleLater: "Entendido, programaré la cita más adelante",
+    appointmentReported: "Indicaste que programaste una cita de seguimiento. Symora no reservó ninguna cita.",
+    laterReported: "Pediste que te recordemos programar tu cita de seguimiento.",
+    responseSaving: "Guardando tu respuesta…",
+    responseSaveError: "No se pudo guardar tu respuesta. Inténtalo de nuevo.",
     openChat: "Abrir el centro de notificaciones",
     closeChat: "Cerrar el centro de notificaciones",
-    unreadMessages: "notificaciones sin leer",
-    reviewedMessage: "Tu médico ha revisado tu reporte de síntomas. Gracias por compartir cómo te sientes.",
-    followUpMessage: "Tu médico quiere dar seguimiento a tu reporte. Comunícate con tu médico para programar una cita. Si es una emergencia, llama al 911.",
-    followUpReminder: "Recordatorio: Comunícate con tu médico para programar una cita de seguimiento sobre tu reporte. Si es una emergencia, llama al 911.",
-    appointmentScheduled: "Cita programada",
-    willScheduleLater: "Entendido, programaré la cita más adelante",
+    notificationCount: "notificaciones",
     reviewTitle: "Revisa tu reporte",
     translatedReport: "Traducción al inglés",
     summary: "Resumen del análisis",
@@ -309,18 +313,20 @@ const copy: Record<Language, {
     savedTag: "✓ 已保存",
     chatTitle: "通知中心",
     careTeam: "您的医生或协调员",
-    you: "您",
-    automatedMessage: "自动消息",
     chatEmpty: "暂无通知。",
-    chatDemoNotice: "仅供演示。消息不安全，请勿用于紧急情况。",
+    chatDemoNotice: "应用内消息不是紧急警报。",
+    notificationsLoading: "正在加载通知…",
+    notificationsError: "无法加载通知。",
+    retry: "重试",
+    appointmentScheduled: "已安排预约",
+    scheduleLater: "知道了，稍后安排预约",
+    appointmentReported: "您表示已安排后续预约。Symora 并未为您预约。",
+    laterReported: "您已请求提醒安排后续预约。",
+    responseSaving: "正在保存您的回复…",
+    responseSaveError: "无法保存您的回复。请重试。",
     openChat: "打开通知中心",
     closeChat: "关闭通知中心",
-    unreadMessages: "条未读通知",
-    reviewedMessage: "您的医生已查看您的症状报告。感谢您分享您的感受。",
-    followUpMessage: "您的医生希望就您的报告与您跟进。请联系您的医生预约。如果是紧急情况，请拨打911。",
-    followUpReminder: "提醒：请联系您的医生，预约讨论您的报告。如果是紧急情况，请拨打911。",
-    appointmentScheduled: "已预约",
-    willScheduleLater: "明白，我稍后预约",
+    notificationCount: "条通知",
     reviewTitle: "请检查您的报告",
     translatedReport: "英文翻译",
     summary: "分析摘要",
@@ -385,18 +391,20 @@ const copy: Record<Language, {
     savedTag: "✓ Đã lưu",
     chatTitle: "Trung tâm thông báo",
     careTeam: "Bác sĩ hoặc điều phối viên của bạn",
-    you: "Bạn",
-    automatedMessage: "Tin nhắn tự động",
     chatEmpty: "Chưa có thông báo.",
-    chatDemoNotice: "Chỉ dùng cho bản demo. Tin nhắn không bảo mật và không dành cho trường hợp khẩn cấp.",
+    chatDemoNotice: "Tin nhắn trong ứng dụng không phải là cảnh báo khẩn cấp.",
+    notificationsLoading: "Đang tải thông báo…",
+    notificationsError: "Không thể tải thông báo.",
+    retry: "Thử lại",
+    appointmentScheduled: "Đã lên lịch cuộc hẹn",
+    scheduleLater: "Đã hiểu, tôi sẽ lên lịch hẹn sau",
+    appointmentReported: "Bạn cho biết đã lên lịch hẹn theo dõi. Symora không đặt lịch hẹn.",
+    laterReported: "Bạn đã yêu cầu được nhắc lên lịch hẹn theo dõi.",
+    responseSaving: "Đang lưu phản hồi…",
+    responseSaveError: "Không thể lưu phản hồi. Vui lòng thử lại.",
     openChat: "Mở trung tâm thông báo",
     closeChat: "Đóng trung tâm thông báo",
-    unreadMessages: "thông báo chưa đọc",
-    reviewedMessage: "Bác sĩ đã xem báo cáo triệu chứng của bạn. Cảm ơn bạn đã chia sẻ về tình trạng của mình.",
-    followUpMessage: "Bác sĩ muốn trao đổi thêm với bạn về báo cáo. Vui lòng liên hệ bác sĩ để đặt lịch hẹn. Nếu khẩn cấp, hãy gọi 911.",
-    followUpReminder: "Nhắc nhở: Vui lòng liên hệ bác sĩ để đặt lịch trao đổi về báo cáo. Nếu khẩn cấp, hãy gọi 911.",
-    appointmentScheduled: "Đã đặt lịch hẹn",
-    willScheduleLater: "Đã hiểu, tôi sẽ đặt lịch sau",
+    notificationCount: "thông báo",
     reviewTitle: "Xem lại báo cáo của bạn",
     translatedReport: "Bản dịch tiếng Anh",
     summary: "Tóm tắt phân tích",
@@ -460,9 +468,11 @@ export default function ReportPage() {
   const [typing, setTyping] = useState(false);
   const [story, setStory] = useState("");
   const [chatOpen, setChatOpen] = useState(false);
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [chatKey, setChatKey] = useState("");
-  const [followUpState, setFollowUpState] = useState<FollowUpState>(noFollowUp);
+  const [notifications, setNotifications] = useState<ParticipantNotification[]>([]);
+  const [notificationsLoading, setNotificationsLoading] = useState(false);
+  const [notificationsError, setNotificationsError] = useState<string | null>(null);
+  const [notificationActionBusy, setNotificationActionBusy] = useState<string | null>(null);
+  const [notificationActionError, setNotificationActionError] = useState<string | null>(null);
   const [reportSource, setReportSource] = useState<"portal" | "voice">("portal");
   const [reportActivity, setReportActivity] = useState<"idle" | "analyzing" | "preparing" | "submitting">("idle");
   const [reportError, setReportError] = useState<string | null>(null);
@@ -477,8 +487,44 @@ export default function ReportPage() {
   const [sessionChecking, setSessionChecking] = useState(false);
   const [logoutBusy, setLogoutBusy] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const notificationRequestRef = useRef<AbortController | null>(null);
 
   const L = copy[lang];
+
+  const loadNotifications = useCallback(async () => {
+    notificationRequestRef.current?.abort();
+    const controller = new AbortController();
+    notificationRequestRef.current = controller;
+    setNotificationsLoading(true);
+    setNotificationsError(null);
+    try {
+      const result = await getParticipantNotifications(controller.signal);
+      if (!controller.signal.aborted) setNotifications(result.notifications);
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setNotificationsError(error instanceof Error ? error.message : "");
+      }
+    } finally {
+      if (notificationRequestRef.current === controller) {
+        notificationRequestRef.current = null;
+        setNotificationsLoading(false);
+      }
+    }
+  }, []);
+
+  async function respondToFollowUp(reportId: string, response: ParticipantFollowUpResponse) {
+    if (notificationActionBusy) return;
+    setNotificationActionBusy(reportId);
+    setNotificationActionError(null);
+    try {
+      await saveParticipantFollowUpResponse(reportId, response);
+      await loadNotifications();
+    } catch {
+      setNotificationActionError(L.responseSaveError);
+    } finally {
+      setNotificationActionBusy(null);
+    }
+  }
 
   useEffect(() => {
     const controller = new AbortController();
@@ -494,89 +540,28 @@ export default function ReportPage() {
           return;
         }
         setSessionReady(true);
+        void loadNotifications();
       })
       .catch(() => {
         if (!controller.signal.aborted) router.replace("/participant-login");
       });
-    return () => controller.abort();
-  }, [router]);
-
-  useEffect(() => {
-    const syncMessages = (next: ChatMessage[]) => {
-      const updated = chatOpen
-        ? next.map((message) =>
-            message.from === "doctor" && !message.readByPatient
-              ? { ...message, readByPatient: true }
-              : message,
-          )
-        : next;
-      if (updated.some((message, index) => message !== next[index])) {
-        writeChatMessages(chatKey, updated);
-      }
-      setChatMessages(updated);
+    return () => {
+      controller.abort();
+      notificationRequestRef.current?.abort();
     };
-
-    syncMessages(readChatMessages(chatKey));
-    return subscribeToChatMessages(chatKey, syncMessages);
-  }, [chatKey, chatOpen]);
-
-  useEffect(() => {
-    const syncFollowUpState = (next: FollowUpState) => {
-      startTransition(() => setFollowUpState(next));
-    };
-    syncFollowUpState(readFollowUpState(DEMO_PARTICIPANT_CODE));
-    return subscribeToFollowUpState(DEMO_PARTICIPANT_CODE, syncFollowUpState);
-  }, []);
-
-  useEffect(() => {
-    if (onboard !== "done") return;
-    const updateDailyChat = () => {
-      const today = new Date().toLocaleDateString("en-CA");
-      const nextKey = dailyChatKey(DEMO_PARTICIPANT_CODE, today);
-      setChatKey((current) => (current === nextKey ? current : nextKey));
-    };
-    const interval = window.setInterval(updateDailyChat, 60_000);
-    return () => window.clearInterval(interval);
-  }, [onboard]);
-
-  useEffect(() => {
-    if (!chatKey || !followUpState.pending || followUpState.appointmentScheduled) return;
-    const today = new Date().toLocaleDateString("en-CA");
-    if (followUpState.lastReminderDate === today) return;
-
-    appendChatMessage(chatKey, {
-      from: "doctor",
-      text: "Reminder: Please contact your doctor to schedule a follow-up about your report. If it is an emergency, call 911.",
-      kind: "follow_up_reminder",
-      auto: true,
-      time: new Date().toLocaleTimeString("en-US", { timeStyle: "short" }),
-      readByPatient: false,
-    });
-    writeFollowUpState(DEMO_PARTICIPANT_CODE, {
-      ...followUpState,
-      lastReminderDate: today,
-    });
-  }, [chatKey, followUpState]);
+  }, [loadNotifications, router]);
 
   useEffect(() => {
     if (chatOpen) chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [chatMessages, chatOpen]);
+  }, [notifications, chatOpen, notificationsLoading, notificationsError]);
 
-  const unreadCount = chatMessages.filter(
-    (message) => message.from === "doctor" && !message.readByPatient,
-  ).length;
-  const visibleChatMessages = chatMessages.filter((message) =>
-    message.from === "doctor"
-      ? message.auto
-      : message.kind === "appointment_scheduled" || message.kind === "will_schedule_later",
-  );
-  const showFollowUpResponses =
-    followUpState.pending &&
-    !followUpState.appointmentScheduled &&
-    visibleChatMessages.some(
-      (message) =>
-        message.kind === "follow_up_requested" || message.kind === "follow_up_reminder",
-    );
+  const notificationCount = notifications.length;
+
+  function toggleNotificationCenter() {
+    const opening = !chatOpen;
+    setChatOpen(opening);
+    if (opening) void loadNotifications();
+  }
 
   function toggleMic() {
     setListening(false);
@@ -625,10 +610,10 @@ export default function ReportPage() {
         setEnglishSummary("");
         setReviewConfirmed(false);
         setSubmittedReport(null);
-        setChatMessages([]);
         setChatOpen(false);
-        setChatKey("");
-        clearParticipantChatData(DEMO_PARTICIPANT_CODE);
+        notificationRequestRef.current?.abort();
+        setNotifications([]);
+        setNotificationsError(null);
         router.replace("/participant-login?session=expired");
         router.refresh();
       }
@@ -720,45 +705,6 @@ export default function ReportPage() {
     }
   }
 
-  function respondToFollowUp(kind: "appointment_scheduled" | "will_schedule_later") {
-    const current = readFollowUpState(DEMO_PARTICIPANT_CODE);
-    if (!chatKey || !current.pending || current.appointmentScheduled) return;
-    const today = new Date().toLocaleDateString("en-CA");
-    appendChatMessage(chatKey, {
-      from: "participant",
-      text:
-        kind === "appointment_scheduled"
-          ? "Appointment Scheduled"
-          : "Understood, Will Schedule Later",
-      kind,
-      time: new Date().toLocaleTimeString("en-US", { timeStyle: "short" }),
-      readByPatient: true,
-    });
-    const nextState: FollowUpState = {
-      ...current,
-      pending: kind !== "appointment_scheduled",
-      appointmentScheduled: kind === "appointment_scheduled",
-      lastReminderDate: today,
-    };
-    setFollowUpState(nextState);
-    writeFollowUpState(DEMO_PARTICIPANT_CODE, nextState);
-  }
-
-  function getLocalizedMessage(message: ChatMessage) {
-    switch (message.kind) {
-      case "reviewed":
-        return L.reviewedMessage;
-      case "follow_up_requested":
-        return L.followUpMessage;
-      case "follow_up_reminder":
-        return L.followUpReminder;
-      case "appointment_scheduled":
-        return L.appointmentScheduled;
-      case "will_schedule_later":
-        return L.willScheduleLater;
-    }
-  }
-
   async function enterApp() {
     setSessionChecking(true);
     setReportError(null);
@@ -776,8 +722,6 @@ export default function ReportPage() {
     } finally {
       setSessionChecking(false);
     }
-    const today = new Date().toLocaleDateString("en-CA");
-    setChatKey(dailyChatKey(DEMO_PARTICIPANT_CODE, today));
     setOnboard("done");
   }
 
@@ -787,9 +731,9 @@ export default function ReportPage() {
     setReportError(null);
     try {
       await logoutBrowserSession();
-      clearParticipantChatData(DEMO_PARTICIPANT_CODE);
-      setChatMessages([]);
-      setChatKey("");
+      notificationRequestRef.current?.abort();
+      setNotifications([]);
+      setNotificationsError(null);
       setChatOpen(false);
       reset();
       router.replace("/participant-login");
@@ -1091,52 +1035,79 @@ export default function ReportPage() {
           </header>
 
           <div aria-live="polite" className="flex flex-1 flex-col gap-2 overflow-y-auto p-4">
-            {visibleChatMessages.length === 0 ? (
-              <p className="m-auto text-sm text-muted">{L.chatEmpty}</p>
-            ) : (
-              visibleChatMessages.map((message, index) => (
-                <div
-                  key={`${message.time}-${index}`}
-                  className={`max-w-[85%] rounded-2xl px-3 py-2 text-sm ${
-                    message.from === "participant"
-                      ? "self-end bg-forest-800 text-white"
-                      : "self-start border border-forest-800/10 bg-sage text-ink"
-                  }`}
-                >
-                  <p className="mb-0.5 text-xs font-semibold opacity-70">
-                    {message.from === "doctor" ? L.careTeam : L.you}
-                  </p>
-                  {message.auto && (
-                    <p className="mb-0.5 text-xs font-semibold uppercase tracking-wide opacity-70">
-                      {L.automatedMessage}
-                    </p>
-                  )}
-                  <p className="whitespace-pre-wrap break-words">{getLocalizedMessage(message)}</p>
-                  <p className="mt-1 text-right text-[11px] opacity-70">{message.time}</p>
-                </div>
-              ))
+            {notificationsLoading && (
+              <p role="status" className="m-auto text-sm text-muted">{L.notificationsLoading}</p>
             )}
+            {notificationsError && (
+              <div role="alert" className="m-auto flex flex-col items-center gap-3 text-center text-sm text-red-900">
+                <p>{L.notificationsError} {notificationsError}</p>
+                <button
+                  type="button"
+                  onClick={() => void loadNotifications()}
+                  className="rounded-full border border-forest-800/25 bg-white px-4 py-2 font-semibold text-forest-800 hover:bg-sage/40"
+                >
+                  {L.retry}
+                </button>
+              </div>
+            )}
+            {notificationActionError && (
+              <p role="alert" className="rounded-xl bg-red-50 p-3 text-sm text-red-900">
+                {notificationActionError}
+              </p>
+            )}
+            {!notificationsLoading && !notificationsError && notifications.length === 0 && (
+              <p className="m-auto text-sm text-muted">{L.chatEmpty}</p>
+            )}
+            {notifications.map((notification) => (
+                <div
+                  key={notification.notificationId}
+                  className="max-w-[85%] self-start rounded-2xl border border-forest-800/10 bg-sage px-3 py-2 text-sm text-ink"
+                >
+                  <p className="mb-0.5 text-xs font-semibold opacity-70">{L.careTeam}</p>
+                  <p className="whitespace-pre-wrap break-words">{notification.message}</p>
+                  {notification.participantResponse === "appointment_scheduled" && (
+                    <p className="mt-2 text-xs font-medium">{L.appointmentReported}</p>
+                  )}
+                  {notification.participantResponse === "will_schedule_later" && (
+                    <p className="mt-2 text-xs font-medium">{L.laterReported}</p>
+                  )}
+                  {(notification.notificationType === "follow_up_requested"
+                    || notification.notificationType === "follow_up_reminder")
+                    && notification.participantResponse !== "appointment_scheduled" && (
+                      <div className="mt-3 flex flex-col gap-2">
+                        {notificationActionBusy === notification.reportId && (
+                          <p role="status" className="text-xs">{L.responseSaving}</p>
+                        )}
+                        {notification.participantResponse !== "will_schedule_later" && (
+                          <button
+                            type="button"
+                            disabled={notificationActionBusy !== null}
+                            onClick={() => void respondToFollowUp(notification.reportId, "will_schedule_later")}
+                            className="rounded-full border border-forest-800/30 bg-white px-3 py-2 text-xs font-semibold text-forest-800 disabled:opacity-50"
+                          >
+                            {L.scheduleLater}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          disabled={notificationActionBusy !== null}
+                          onClick={() => void respondToFollowUp(notification.reportId, "appointment_scheduled")}
+                          className="rounded-full bg-forest-800 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
+                        >
+                          {L.appointmentScheduled}
+                        </button>
+                      </div>
+                    )}
+                  <time
+                    dateTime={notification.createdAt}
+                    className="mt-1 block text-right text-[11px] opacity-70"
+                  >
+                    {formatNotificationTimestamp(notification.createdAt, lang)}
+                  </time>
+                </div>
+            ))}
             <div ref={chatEndRef} />
           </div>
-
-          {showFollowUpResponses && (
-            <div className="flex flex-col gap-2 border-t border-forest-800/15 p-3">
-              <button
-                type="button"
-                onClick={() => respondToFollowUp("appointment_scheduled")}
-                className="min-h-11 w-full rounded-full bg-forest-800 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-leaf"
-              >
-                {L.appointmentScheduled}
-              </button>
-              <button
-                type="button"
-                onClick={() => respondToFollowUp("will_schedule_later")}
-                className="min-h-11 w-full rounded-full border border-forest-800/25 bg-white px-4 py-2 text-sm font-semibold text-forest-800 transition-colors hover:bg-sage/40"
-              >
-                {L.willScheduleLater}
-              </button>
-            </div>
-          )}
 
           <p className="px-4 pb-2 text-xs text-muted">{L.chatDemoNotice}</p>
         </section>
@@ -1144,11 +1115,11 @@ export default function ReportPage() {
 
       <button
         type="button"
-        onClick={() => setChatOpen((open) => !open)}
+        onClick={toggleNotificationCenter}
         aria-label={
           chatOpen
             ? L.closeChat
-            : `${L.openChat}${unreadCount ? `, ${unreadCount} ${L.unreadMessages}` : ""}`
+            : `${L.openChat}${notificationCount ? `, ${notificationCount} ${L.notificationCount}` : ""}`
         }
         aria-expanded={chatOpen}
         aria-controls="patient-chat-panel"
@@ -1158,12 +1129,12 @@ export default function ReportPage() {
         <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
           <path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8A8.5 8.5 0 0 1 8.7 4a8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8Z" />
         </svg>
-        {unreadCount > 0 && (
+        {notificationCount > 0 && (
           <span
             aria-hidden="true"
             className="absolute -right-1 -top-1 flex h-6 min-w-6 items-center justify-center rounded-full border-2 border-white bg-red-600 px-1 text-xs font-bold text-white"
           >
-            {unreadCount > 9 ? "9+" : unreadCount}
+            {notificationCount > 9 ? "9+" : notificationCount}
           </span>
         )}
       </button>

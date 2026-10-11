@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
   runMigration, parseMigrationArguments, parseMigrationSelection, verifyMigrationBytes, queries,
-  CONFIRMATION, BROWSER_AUTH_CONFIRMATION,
+  CONFIRMATION, BROWSER_AUTH_CONFIRMATION, FOLLOW_UP_CONFIRMATION,
 } from "../scripts/migrate-tigerdata.mjs";
 import { metadataQueries } from "../scripts/inspect-tigerdata.mjs";
 import { columns, checks, keys, foreignKeys, indexes, TABLES, checkTree, verifySchema } from "../lib/migration-contract.mjs";
@@ -11,9 +11,14 @@ import {
   BROWSER_AUTH_TABLES, browserAuthColumns, browserAuthChecks, browserAuthKeys, browserAuthIndexes,
   verifyBrowserAuthSchema,
 } from "../lib/browser-auth-migration-contract.mjs";
+import {
+  FOLLOW_UP_TABLES, followUpColumns, followUpChecks, followUpKeys, followUpForeignKeys, followUpIndexes,
+  verifyFollowUpSchema,
+} from "../lib/follow-up-migration-contract.mjs";
 
 const migration = readFileSync(new URL("../db/migrations/001_initial_schema.sql", import.meta.url));
 const browserAuthMigration = readFileSync(new URL("../db/migrations/002_browser_auth_state.sql", import.meta.url));
+const followUpMigration = readFileSync(new URL("../db/migrations/003_participant_follow_up_responses.sql", import.meta.url));
 const secret = "MOCK_SECRET_NEVER_LOG";
 const expectedHost = "synthetic.example.invalid";
 const execute = ["--execute", "--approve-migration=001"];
@@ -47,12 +52,28 @@ function browserAuthSnapshot18() {
   };
 }
 
+function followUpSnapshot18() {
+  const base = { validated: true, enforced: true, deferrable: false, deferred: false };
+  return {
+    tables: FOLLOW_UP_TABLES.map((name) => ({ name, schema: "public", kind: "r", persistence: "p", owned: true, row_security: false })),
+    columns: Object.entries(followUpColumns).flatMap(([table, entries]) => entries.map(([name, type, not_null, default_expression]) => ({ table, name, type, not_null, default_expression }))),
+    constraints: [
+      ...followUpKeys,
+      ...followUpForeignKeys.map((key) => ({ ...key, target_schema: "public", target_columns: ["id"], deletion: "r", update: "a", match: "s" })),
+      ...followUpChecks.map((check) => ({ ...check })),
+      ...Object.entries(followUpColumns).flatMap(([table, entries]) => entries.filter((entry) => entry[2]).map(([name]) => ({ ...base, table, name: `${table}_${name}_not_null`, kind: "n", columns: [name] }))),
+    ].map((constraint) => ({ ...base, ...constraint })),
+    indexes: followUpIndexes.map((index) => ({ ...index, schema: "public", nulls_first: index.descending, method: "btree", valid: true, ready: true, partial: false, expression: false, included: false })),
+  };
+}
+
 function setup(settings = {}) {
   const calls = [], logs = [], errors = [], released = [], options = [];
   let opened = 0, closed = 0;
   let clientErrorListener;
   const snapshot = snapshot18();
   const browserAuthSnapshot = browserAuthSnapshot18();
+  const followUpSnapshot = followUpSnapshot18();
   settings.mutate?.(snapshot);
   const client = {
     on(event, listener) { assert.equal(event, "error"); clientErrorListener = listener; },
@@ -71,9 +92,14 @@ function setup(settings = {}) {
       if (sql === metadataQueries.conflicts) return { rows: settings.conflicts ?? [] };
       for (const key of ["tables", "columns", "constraints", "indexes"]) if (sql === queries[key]) {
         const requested = values?.[1] ?? TABLES;
-        if (requested.length === TABLES.length) return { rows: snapshot[key] };
-        const rows = [...snapshot[key], ...browserAuthSnapshot[key]];
-        return { rows: rows.filter((row) => requested.includes(key === "tables" ? row.name : row.table)) };
+        if (requested.length === TABLES.length && TABLES.every((name) => requested.includes(name))) return { rows: snapshot[key] };
+        if (requested.length === BROWSER_AUTH_TABLES.length && BROWSER_AUTH_TABLES.every((name) => requested.includes(name))) return { rows: browserAuthSnapshot[key] };
+        if (requested.length === FOLLOW_UP_TABLES.length && FOLLOW_UP_TABLES.every((name) => requested.includes(name))) return { rows: followUpSnapshot[key] };
+        const combined = [
+          [snapshot, TABLES], [browserAuthSnapshot, BROWSER_AUTH_TABLES], [followUpSnapshot, FOLLOW_UP_TABLES],
+        ].filter(([, names]) => names.every((name) => requested.includes(name)))
+          .flatMap(([source]) => source[key]);
+        return { rows: combined.filter((row) => requested.includes(key === "tables" ? row.name : row.table)) };
       }
       if (sql === "COMMIT") return { command: settings.commitCommand ?? "COMMIT", rows: [] };
       return { rows: [] };
@@ -81,10 +107,11 @@ function setup(settings = {}) {
     release(destroy) { released.push(destroy); if (settings.releaseFails) throw new Error(secret); },
   };
   const run = () => runMigration({
-    args: settings.args ?? [], confirmation: settings.confirmation ?? (settings.args?.includes("--migration=002") ? BROWSER_AUTH_CONFIRMATION : CONFIRMATION),
+    args: settings.args ?? [], confirmation: settings.confirmation ?? (settings.args?.includes("--migration=003")
+      ? FOLLOW_UP_CONFIRMATION : settings.args?.includes("--migration=002") ? BROWSER_AUTH_CONFIRMATION : CONFIRMATION),
     expectedHost: settings.expectedHost ?? expectedHost, expectedDatabase: settings.expectedDatabase ?? "tsdb",
     connectionString: settings.connectionString ?? `postgresql://mock:${secret}@${expectedHost}:5432/tsdb?sslmode=require`,
-    loadMigration: async (version) => settings.bytes ?? (version === "002" ? browserAuthMigration : migration),
+    loadMigration: async (version) => settings.bytes ?? (version === "003" ? followUpMigration : version === "002" ? browserAuthMigration : migration),
     makeDatabase: (config, onError) => {
       options.push(config);
       return {
@@ -103,6 +130,8 @@ test("reviewed migration bytes pass the pinned checksum; every byte matters", ()
   assert.throws(() => verifyMigrationBytes(migration.toString("utf8")));
   assert.equal(verifyMigrationBytes(browserAuthMigration, "002"), browserAuthMigration.toString("utf8"));
   assert.throws(() => verifyMigrationBytes(Buffer.concat([browserAuthMigration, Buffer.from("\n")]), "002"));
+  assert.equal(verifyMigrationBytes(followUpMigration, "003"), followUpMigration.toString("utf8"));
+  assert.throws(() => verifyMigrationBytes(Buffer.concat([followUpMigration, Buffer.from("\n")]), "003"));
 });
 
 test("verification manifest matches all explicit index definitions in the reviewed file", () => {
@@ -125,6 +154,8 @@ test("execution requires exactly both approval flags; default is preflight", () 
   assert.deepEqual(parseMigrationSelection(["--migration=002"]), { mode: "preflight", version: "002" });
   assert.deepEqual(parseMigrationSelection(["--migration=002", "--execute", "--approve-migration=002"]), { mode: "execute", version: "002" });
   assert.throws(() => parseMigrationSelection(["--migration=002", "--execute", "--approve-migration=001"]));
+  assert.deepEqual(parseMigrationSelection(["--migration=003"]), { mode: "preflight", version: "003" });
+  assert.deepEqual(parseMigrationSelection(["--migration=003", "--execute", "--approve-migration=003"]), { mode: "execute", version: "003" });
 });
 
 test("migration 002 contract matches its explicit SQL tables, constraints, and indexes", () => {
@@ -132,6 +163,13 @@ test("migration 002 contract matches its explicit SQL tables, constraints, and i
   assert.match(browserAuthMigration.toString("utf8"), /PRIMARY KEY \(scope, bucket_hash\)/);
   assert.match(browserAuthMigration.toString("utf8"), /CREATE INDEX rate_limit_buckets_expires_idx/);
   assert.match(queries.indexes, /indisvalid/);
+});
+
+test("migration 003 contract verifies participant response and daily reminder tables", () => {
+  verifyFollowUpSchema(followUpSnapshot18());
+  assert.match(followUpMigration.toString("utf8"), /PRIMARY KEY \(report_id, reminder_date\)/);
+  assert.match(followUpMigration.toString("utf8"), /response IN \('appointment_scheduled', 'will_schedule_later'\)/);
+  assert.match(followUpMigration.toString("utf8"), /CREATE INDEX participant_follow_up_responses_participant_idx/);
 });
 
 test("002 preflight verifies migration 001 and detects conflicts without DDL", async () => {
@@ -156,6 +194,28 @@ test("approved migration 002 checks the baseline and verifies shared-state schem
   ]);
   assert.equal(JSON.parse(state.logs[0]).status, "MIGRATION_002_COMMITTED");
   assert.equal(state.options[0].application_name, "symora-migration-002");
+});
+
+test("003 preflight verifies prior schema and performs no DDL", async () => {
+  const state = setup({ args: ["--migration=003"] });
+  assert.equal(await state.run(), true);
+  assert.deepEqual(state.calls.map(({ sql }) => sql), [
+    "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", metadataQueries.identity,
+    queries.permissions, queries.tables, queries.columns, queries.constraints, queries.indexes,
+    queries.tables, queries.columns, queries.constraints, queries.indexes,
+    metadataQueries.conflicts, "ROLLBACK",
+  ]);
+  assert.equal(JSON.parse(state.logs[0]).status, "PREFLIGHT_003_PASSED_NO_CHANGES");
+  assert.ok(!state.calls.some(({ sql }) => sql === followUpMigration.toString("utf8")));
+});
+
+test("approved migration 003 verifies base/auth schema and follow-up tables before commit", async () => {
+  const state = setup({ args: ["--migration=003", "--execute", "--approve-migration=003"] });
+  assert.equal(await state.run(), true);
+  assert.ok(state.calls.some(({ sql }) => sql === followUpMigration.toString("utf8")));
+  assert.equal(state.calls.at(-1).sql, "COMMIT");
+  assert.equal(JSON.parse(state.logs[0]).status, "MIGRATION_003_COMMITTED");
+  assert.equal(state.options[0].application_name, "symora-migration-003");
 });
 
 test("002 stops before DDL if the baseline is not the verified 001 schema or auth names conflict", async () => {

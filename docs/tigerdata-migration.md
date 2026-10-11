@@ -79,3 +79,31 @@ never retries automatically. Inspect read-only before deciding the next action.
 A confirmed commit followed by cleanup failure is reported as committed, not
 rolled back. Normal success is `MIGRATION_001_COMMITTED`; preflight success is
 `PREFLIGHT_PASSED_NO_CHANGES`. Driver errors and credentials are never logged.
+
+## Migration 003 — participant follow-up responses and reminders
+
+Migration 003 is additive and leaves 001 and 002 unchanged. It adds
+`participant_follow_up_responses` for a participant's self-reported response and
+`participant_follow_up_reminders` for a single in-app reminder per report and UTC
+calendar date. It does not schedule appointments or send background notifications.
+The migration runner verifies the complete existing 001 and 002 contracts before
+checking or applying 003, then verifies the new tables, constraints, and indexes
+before commit.
+
+The runner supports a read-only preflight:
+
+```sh
+node --env-file=.env.local scripts/migrate-tigerdata.mjs --migration=003 --preflight
+```
+
+Execution is **not approved by this code change** and must not be run without
+separate explicit database-migration approval. If approved later, the runner
+requires both flags below and an interactive confirmation of
+`APPLY SYMORA 003 TO tsdb.public`:
+
+```sh
+node --env-file=.env.local scripts/migrate-tigerdata.mjs --migration=003 --execute --approve-migration=003
+```
+
+Reviewed migration SHA-256:
+`da3893a28c406eda97a5abf6a960ab8b30cf4f6b4b7583f7c60a7bdb44b421a0`.

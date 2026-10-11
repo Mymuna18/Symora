@@ -38,6 +38,7 @@ const submit = (await import("../app/api/reports/route.ts")).POST;
 const coordinator = (await import("../app/api/coordinator/reports/route.ts")).GET;
 const reviewStatus = (await import("../app/api/coordinator/reports/[reportId]/status/route.ts")).PATCH;
 const notifications = (await import("../app/api/participant/notifications/route.ts")).GET;
+const followUpResponse = (await import("../app/api/participant/follow-up-response/route.ts")).POST;
 
 function request(path, body, cookie, overrides = {}, method = "POST") {
   return new Request(`${origin}${path}`, { method,
@@ -72,7 +73,7 @@ beforeEach(() => {
   }]);
   process.env.GEMINI_API_KEY = "fictional-key-only";
   const state = { analysis, providerCalls: 0, sql: [], sessions: new Map(), rateLimits: new Map(),
-    reviewStatus: "submitted", reviewHistory: [], pool: null };
+    reviewStatus: "submitted", reviewHistory: [], followUpResponse: null, pool: null };
   const query = async (sql, values) => {
     state.sql.push({ sql, values });
     if (sql.includes("SELECT account_key_hash") && sql.includes("FROM browser_auth_sessions")) {
@@ -95,7 +96,17 @@ beforeEach(() => {
     if (sql.includes("WITH page")) return { rows: [{ id: reportId, participantCode: "DEMO-001", workflowStatus: "submitted", symptoms: [] }] };
     if (sql.includes('AS "notificationId"')) return { rows: state.reviewHistory
       .filter((row) => row.report_id === reportId && values[0] === participantId)
-      .map((row) => ({ notificationId: row.id, reportId: row.report_id, message: row.review_note, createdAt: row.created_at })) };
+      .map((row) => ({
+        notificationId: row.id,
+        reportId: row.report_id,
+        message: row.new_workflow_status === "reviewed"
+          ? "Your symptom report has been reviewed by the study team. Thank you for submitting your report."
+          : row.review_note,
+        createdAt: row.created_at,
+        notificationType: row.new_workflow_status,
+        participantResponse: state.followUpResponse?.response ?? null,
+        responseUpdatedAt: state.followUpResponse?.responded_at ?? null,
+      })) };
     if (sql.includes("SELECT code, display_name")) return { rows: [{ code: "headache", display_name: "Headache" }] };
     if (sql.includes("FROM participants")) return { rows: [{ id: participantId }] };
     if (sql.includes("SELECT id, code FROM symptoms")) return { rows: [{ id: "33333333-3333-4333-8333-333333333333", code: "headache" }] };
@@ -127,6 +138,25 @@ beforeEach(() => {
         };
         state.reviewHistory.push(review);
         return { rows: [review] };
+      }
+      if (sql.includes("FROM public.reports WHERE id = $1 AND participant_id = $2 FOR UPDATE")) {
+        return { rows: values[1] === participantId ? [{ id: reportId }] : [] };
+      }
+      if (sql.includes("FROM public.review_history")
+        && sql.includes("new_workflow_status = 'follow_up_requested'")) {
+        return { rows: state.reviewHistory.some((review) => review.report_id === values[0]
+          && review.new_workflow_status === "follow_up_requested") ? [{ "?column?": 1 }] : [] };
+      }
+      if (sql.includes("FROM public.participant_follow_up_responses")) {
+        return { rows: state.followUpResponse ? [state.followUpResponse] : [] };
+      }
+      if (sql.startsWith("INSERT INTO public.participant_follow_up_responses")) {
+        state.followUpResponse = { response: values[2], responded_at: new Date("2026-10-12T10:00:00.000Z") };
+        return { rows: [state.followUpResponse] };
+      }
+      if (sql.startsWith("UPDATE public.participant_follow_up_responses")) {
+        state.followUpResponse = { response: values[2], responded_at: new Date("2026-10-13T10:00:00.000Z") };
+        return { rows: [state.followUpResponse] };
       }
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK"
         || sql.includes("INSERT INTO browser_auth_sessions")
@@ -211,6 +241,16 @@ test("coordinator review and participant notifications use verified sessions and
   assert.equal(changedBody.review.reviewerUserId, "demo-coordinator");
   assert.equal(globalThis.__browserWorkflow.reviewHistory[0].reviewer_user_id, "demo-coordinator");
 
+  const noCsrfResponse = await followUpResponse(request("/api/participant/follow-up-response", {
+    reportId, response: "will_schedule_later",
+  }, participantCookie, { "x-symora-csrf": "" }));
+  assert.equal(noCsrfResponse.status, 403);
+  const savedResponse = await followUpResponse(request("/api/participant/follow-up-response", {
+    reportId, response: "will_schedule_later",
+  }, participantCookie));
+  assert.equal(savedResponse.status, 200, await savedResponse.clone().text());
+  assert.equal((await savedResponse.json()).response, "will_schedule_later");
+
   const feed = await notifications(request("/api/participant/notifications", undefined, participantCookie, {}, "GET"));
   assert.equal(feed.status, 200);
   const feedBody = await feed.json();
@@ -219,6 +259,9 @@ test("coordinator review and participant notifications use verified sessions and
     reportId,
     message: "Please clarify when the fictional headache began.",
     createdAt: "2026-10-11T09:00:00.000Z",
+    notificationType: "follow_up_requested",
+    participantResponse: "will_schedule_later",
+    responseUpdatedAt: "2026-10-12T10:00:00.000Z",
   }] });
   assert.doesNotMatch(JSON.stringify(feedBody), /reviewer_user_id|demo-coordinator/);
   assert.equal((await notifications(request("/api/participant/notifications", undefined, coordinatorCookie, {}, "GET"))).status, 403);

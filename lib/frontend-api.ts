@@ -21,6 +21,30 @@ export class ApiError extends Error {
   }
 }
 
+export type ParticipantNotification = {
+  notificationId: string;
+  reportId: string;
+  message: string;
+  createdAt: string;
+  notificationType: "reviewed" | "follow_up_requested" | "follow_up_reminder";
+  participantResponse: "appointment_scheduled" | "will_schedule_later" | null;
+  responseUpdatedAt: string | null;
+};
+
+export type ParticipantNotificationsResponse = {
+  notifications: ParticipantNotification[];
+};
+
+export type ParticipantFollowUpResponse =
+  | "appointment_scheduled"
+  | "will_schedule_later";
+
+export type ParticipantFollowUpResponseResult = {
+  reportId: string;
+  response: ParticipantFollowUpResponse;
+  respondedAt: string;
+};
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
@@ -87,6 +111,23 @@ export function submitReport(input: SubmitReportRequest) {
 
 export function getBrowserSession(signal?: AbortSignal) {
   return requestJson<BrowserSession>("/api/auth/session", { method: "GET", signal });
+}
+
+export function getParticipantNotifications(signal?: AbortSignal) {
+  return requestJson<ParticipantNotificationsResponse>("/api/participant/notifications", {
+    method: "GET",
+    signal,
+  });
+}
+
+export function saveParticipantFollowUpResponse(
+  reportId: string,
+  response: ParticipantFollowUpResponse,
+) {
+  return postJson<ParticipantFollowUpResponseResult>(
+    "/api/participant/follow-up-response",
+    { reportId, response },
+  );
 }
 
 export function loginParticipant(username: string, password: string) {
