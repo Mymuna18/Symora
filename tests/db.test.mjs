@@ -29,7 +29,8 @@ test("pool creation is lazy and uses bounded connection settings", () => {
   assert.equal(instances.length, 0);
   assert.deepEqual(db.getPool().options, {
     connectionString: "postgres://fictional-test-only",
-    max: 5, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 10_000,
+    max: 2, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 10_000,
+    statement_timeout: 5_000,
   });
 });
 

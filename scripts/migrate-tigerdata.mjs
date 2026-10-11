@@ -6,16 +6,41 @@ import { pathToFileURL } from "node:url";
 import { createDatabase } from "../lib/db-pool.mjs";
 import { inspectionPoolOptions, metadataQueries } from "./inspect-tigerdata.mjs";
 import { DATABASE, SCHEMA, TABLES, OBJECT_NAMES, TYPE_NAMES, MIGRATION_SHA256, verifySchema } from "../lib/migration-contract.mjs";
+import {
+  BROWSER_AUTH_TABLES, BROWSER_AUTH_OBJECT_NAMES, BROWSER_AUTH_TYPE_NAMES, verifyBrowserAuthSchema,
+} from "../lib/browser-auth-migration-contract.mjs";
 
 export const CONFIRMATION = "APPLY SYMORA 001 TO tsdb.public";
 export const MIGRATION_URL = new URL("../db/migrations/001_initial_schema.sql", import.meta.url);
-export function parseMigrationArguments(args) {
-  if (args.length === 0 || (args.length === 1 && args[0] === "--preflight")) return "preflight";
-  if (args.length === 2 && new Set(args).size === 2 && args.includes("--execute") && args.includes("--approve-migration=001")) return "execute";
-  throw new Error("Use --preflight, or both --execute and --approve-migration=001 after approval.");
+export const BROWSER_AUTH_CONFIRMATION = "APPLY SYMORA 002 TO tsdb.public";
+export const BROWSER_AUTH_MIGRATION_URL = new URL("../db/migrations/002_browser_auth_state.sql", import.meta.url);
+const MIGRATIONS = Object.freeze({
+  "001": { url: MIGRATION_URL, sha256: MIGRATION_SHA256, tables: TABLES, objects: OBJECT_NAMES, types: TYPE_NAMES },
+  "002": { url: BROWSER_AUTH_MIGRATION_URL, sha256: "2e68869d2bb21672c88456f85ed84d12d97da335deacc61d346ad0a49e698351",
+    tables: BROWSER_AUTH_TABLES, objects: BROWSER_AUTH_OBJECT_NAMES, types: BROWSER_AUTH_TYPE_NAMES },
+});
+
+export function parseMigrationSelection(args) {
+  const versionFlags = args.filter((arg) => arg.startsWith("--migration="));
+  if (versionFlags.length > 1 || args.some((arg) => arg.startsWith("--migration=") && !["--migration=001", "--migration=002"].includes(arg))) {
+    throw new Error("Unsupported migration version.");
+  }
+  const version = versionFlags[0]?.slice("--migration=".length) ?? "001";
+  const commandArgs = args.filter((arg) => !arg.startsWith("--migration="));
+  if (commandArgs.length === 0 || (commandArgs.length === 1 && commandArgs[0] === "--preflight")) return { mode: "preflight", version };
+  if (commandArgs.length === 2 && new Set(commandArgs).size === 2
+    && commandArgs.includes("--execute") && commandArgs.includes(`--approve-migration=${version}`)) {
+    return { mode: "execute", version };
+  }
+  throw new Error(`Use --migration=${version} for preflight, or --migration=${version} --execute --approve-migration=${version} after approval.`);
 }
-export function verifyMigrationBytes(bytes) {
-  if (!Buffer.isBuffer(bytes) || createHash("sha256").update(bytes).digest("hex") !== MIGRATION_SHA256) throw new Error("Reviewed migration checksum mismatch.");
+export function parseMigrationArguments(args) { return parseMigrationSelection(args).mode; }
+
+export function verifyMigrationBytes(bytes, version = "001") {
+  if (!MIGRATIONS[version] || !Buffer.isBuffer(bytes)
+    || createHash("sha256").update(bytes).digest("hex") !== MIGRATIONS[version].sha256) {
+    throw new Error("Reviewed migration checksum mismatch.");
+  }
   return bytes.toString("utf8");
 }
 
@@ -81,7 +106,7 @@ function databaseFor(options, onError) {
 }
 
 export async function runMigration({ args = [], confirmation = "", expectedHost, expectedDatabase,
-  connectionString, loadMigration = () => readFile(MIGRATION_URL), makeDatabase = databaseFor,
+  connectionString, loadMigration = (version) => readFile(MIGRATIONS[version].url), makeDatabase = databaseFor,
   log = console.log, logError = console.error }) {
   let database;
   let client;
@@ -93,14 +118,18 @@ export async function runMigration({ args = [], confirmation = "", expectedHost,
   const onConnectionError = () => { connectionFailed = true; };
   let stage = "configuration/checksum/approval";
   let mode;
+  let version;
+  let migration;
   try {
-    mode = parseMigrationArguments(args);
-    if (expectedDatabase !== DATABASE || (mode === "execute" && confirmation !== CONFIRMATION)) throw new Error("Approval or target mismatch.");
+    ({ mode, version } = parseMigrationSelection(args));
+    migration = MIGRATIONS[version];
+    const requiredConfirmation = version === "001" ? CONFIRMATION : BROWSER_AUTH_CONFIRMATION;
+    if (expectedDatabase !== DATABASE || (mode === "execute" && confirmation !== requiredConfirmation)) throw new Error("Approval or target mismatch.");
     const options = inspectionPoolOptions(connectionString, expectedHost, expectedDatabase);
-    const sql = verifyMigrationBytes(await loadMigration());
+    const sql = verifyMigrationBytes(await loadMigration(version), version);
     // Keep startup default read-only in BOTH modes. Only the explicit approved
     // transaction below can enable writes. URL and inherited PG* overrides cannot.
-    options.application_name = "symora-migration-001";
+    options.application_name = `symora-migration-${version}`;
     options.query_timeout = 35_000;
     options.options = "-c default_transaction_read_only=on -c search_path=public -c statement_timeout=30000 -c lock_timeout=5000 -c idle_in_transaction_session_timeout=60000";
     database = makeDatabase(options, onConnectionError);
@@ -122,7 +151,14 @@ export async function runMigration({ args = [], confirmation = "", expectedHost,
     const permissions = (await client.query(queries.permissions, [SCHEMA])).rows[0];
     if (!permissions?.can_use || !permissions.can_create || permissions.external_default_grants !== false
       || !Number.isInteger(permissions.version) || Math.floor(permissions.version / 10000) !== 18) throw new Error("Permissions or PostgreSQL version require review.");
-    const conflicts = (await client.query(metadataQueries.conflicts, [SCHEMA, OBJECT_NAMES, TYPE_NAMES])).rows;
+    if (version === "002") {
+      stage = "base-schema verification";
+      const baseline = {};
+      for (const key of ["tables", "columns", "constraints", "indexes"]) baseline[key] = (await client.query(queries[key], [SCHEMA, TABLES])).rows;
+      verifySchema(baseline);
+    }
+    stage = "identity/permissions/conflicts";
+    const conflicts = (await client.query(metadataQueries.conflicts, [SCHEMA, migration.objects, migration.types])).rows;
     if (conflicts.length !== 0 || connectionFailed) throw new Error("Migration conflict.");
     if (mode === "execute") {
       stage = "migration";
@@ -130,8 +166,22 @@ export async function runMigration({ args = [], confirmation = "", expectedHost,
       await client.query(sql);
       stage = "schema verification";
       const snapshot = {};
-      for (const key of ["tables", "columns", "constraints", "indexes"]) snapshot[key] = (await client.query(queries[key], [SCHEMA, TABLES])).rows;
-      verifySchema(snapshot);
+      const allTables = version === "001" ? TABLES : [...TABLES, ...BROWSER_AUTH_TABLES];
+      for (const key of ["tables", "columns", "constraints", "indexes"]) snapshot[key] = (await client.query(queries[key], [SCHEMA, allTables])).rows;
+      if (version === "001") verifySchema(snapshot);
+      else {
+        const baseSnapshot = {};
+        const authSnapshot = {};
+        for (const key of ["tables", "columns", "constraints", "indexes"]) {
+          const tableOf = key === "tables" ? (row) => row.name : (row) => row.table;
+          baseSnapshot[key] = snapshot[key].filter((row) => TABLES.includes(tableOf(row)));
+          authSnapshot[key] = snapshot[key].filter((row) => BROWSER_AUTH_TABLES.includes(tableOf(row)));
+        }
+        stage = "base schema verification";
+        verifySchema(baseSnapshot);
+        stage = "browser-auth schema verification";
+        verifyBrowserAuthSchema(authSnapshot);
+      }
       if (connectionFailed) throw new Error("Connection failed.");
       stage = "commit";
       commitAttempted = true;
@@ -167,10 +217,10 @@ export async function runMigration({ args = [], confirmation = "", expectedHost,
     if (connectionFailed) success = false;
   }
   if (success) log(JSON.stringify({
-    status: mode === "execute" ? "MIGRATION_001_COMMITTED" : "PREFLIGHT_PASSED_NO_CHANGES",
+    status: mode === "execute" ? `MIGRATION_${version}_COMMITTED` : `PREFLIGHT_${version}_PASSED_NO_CHANGES`,
     database_matches_expected: true, schema: SCHEMA, tls_verified: true,
-    migration_sha256: MIGRATION_SHA256, postgres_major: 18,
-    note: mode === "execute" ? "Five tables and their constraints/indexes verified before commit. No seed or grants performed." : "DDL has not been executed or validated on this server. Separate execution approval is required.",
+    migration_sha256: migration.sha256, postgres_major: 18,
+    note: mode === "execute" ? "Migration tables, constraints, and indexes verified before commit. No seed or grants performed." : "DDL has not been executed or validated on this server. Separate execution approval is required.",
   }, null, 2));
   else if (committed) logError("Migration committed, but cleanup failed. Do not rerun the migration.");
   return success;
@@ -178,15 +228,16 @@ export async function runMigration({ args = [], confirmation = "", expectedHost,
 
 export async function main() {
   const args = process.argv.slice(2);
-  const mode = parseMigrationArguments(args);
+  const { mode, version } = parseMigrationSelection(args);
   if (!process.stdin.isTTY) throw new Error("Interactive confirmation required.");
-  console.log(`Symora 001 ${mode}. Enter expected development details from TigerData's console. Never enter a password or connection string.`);
+  const requiredConfirmation = version === "001" ? CONFIRMATION : BROWSER_AUTH_CONFIRMATION;
+  console.log(`Symora ${version} ${mode}. Enter expected development details from TigerData's console. Never enter a password or connection string.`);
   const terminal = createInterface({ input: process.stdin, output: process.stdout });
   let expectedHost, expectedDatabase, confirmation = "";
   try {
     expectedHost = (await terminal.question("Expected development hostname: ")).trim();
     expectedDatabase = (await terminal.question("Expected database name (reviewed target: tsdb): ")).trim();
-    if (mode === "execute") confirmation = await terminal.question(`Only after separate approval, type ${CONFIRMATION}: `);
+    if (mode === "execute") confirmation = await terminal.question(`Only after separate approval, type ${requiredConfirmation}: `);
   } finally { terminal.close(); }
   return runMigration({ args, expectedHost, expectedDatabase, confirmation, connectionString: process.env.DATABASE_URL });
 }
