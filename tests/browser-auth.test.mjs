@@ -165,6 +165,33 @@ for (const [label, changes] of [
   });
 }
 
+test("configuration diagnostics identify only the failing category without logging configuration values", async () => {
+  const cases = [
+    [{ SYMORA_BROWSER_AUTH_ENABLED: "TRUE" }, "auth-enabled"],
+    [{ SYMORA_BROWSER_AUTH_ORIGIN: "not a URL or secret" }, "origin"],
+    [{ SYMORA_BROWSER_SESSION_KEY: "synthetic-session-secret" }, "session-key-format"],
+    [{ SYMORA_BROWSER_ACCOUNTS: "{\"password\":\"synthetic-password-secret\"" }, "accounts-json-format"],
+    [{ SYMORA_BROWSER_ACCOUNTS: JSON.stringify([{ ...accounts()[0], passwordHash: "synthetic-hash-secret" }]) }, "account-schema"],
+  ];
+  for (const [changes, expectedCategory] of cases) {
+    await withEnvironment(changes, () => {
+      const entries = [];
+      const originalError = console.error;
+      console.error = (...args) => entries.push(args);
+      try {
+        assert.throws(readBrowserConfig, errorIs(503, "BROWSER_AUTH_UNAVAILABLE"));
+      } finally {
+        console.error = originalError;
+      }
+      assert.deepEqual(entries, [[
+        "[symora] browser auth configuration validation failed",
+        { category: expectedCategory },
+      ]]);
+      assert.doesNotMatch(JSON.stringify(entries), /synthetic-session-secret|synthetic-password-secret|synthetic-hash-secret/);
+    });
+  }
+});
+
 for (const role of ["participant", "coordinator"]) {
   test(`${role} login sets a private local cookie and authenticates its configured identity`, async () => {
     const { auth } = fixture();
