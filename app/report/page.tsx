@@ -16,6 +16,7 @@ import {
   type ParticipantFollowUpResponse,
 } from "@/lib/frontend-api";
 import { MicHero } from "@/components/ui/MicHero";
+import { useRecorder } from "@/hooks/useRecorder";
 import {
   ParticipantReportReview,
   type EditablePreparedSymptom,
@@ -61,6 +62,10 @@ const copy: Record<Language, {
   howFeeling: string;
   tap: string;
   listening: string;
+  transcribing: string;
+  transcriptInstruction: string;
+  confirmTranscript: string;
+  rerecord: string;
   typeInstead: string;
   typePlaceholder: string;
   heard: string;
@@ -121,7 +126,6 @@ const copy: Record<Language, {
   submittingReport: string;
   cancelReview: string;
   authLink: string;
-  voiceUnavailable: string;
   analyzing: string;
   preparing: string;
   historyNotConnected: string;
@@ -139,6 +143,10 @@ const copy: Record<Language, {
     howFeeling: "How are you feeling today?",
     tap: "Tap and talk",
     listening: "Listening… tap to stop",
+    transcribing: "Transcribing your recording…",
+    transcriptInstruction: "Review and edit the transcript. It will not be analyzed until you confirm.",
+    confirmTranscript: "Use this transcript and continue",
+    rerecord: "Record again",
     typeInstead: "Type instead",
     typePlaceholder: "Write how you are feeling",
     heard: "I heard:",
@@ -199,7 +207,6 @@ const copy: Record<Language, {
     submittingReport: "Submitting…",
     cancelReview: "Edit my report",
     authLink: "Open participant sign-in",
-    voiceUnavailable: "Voice transcription is not connected yet. You can type your report instead.",
     analyzing: "Analyzing your report…",
     preparing: "Preparing symptom details…",
     historyNotConnected: "Past report history is not available from the current participant API.",
@@ -217,6 +224,10 @@ const copy: Record<Language, {
     howFeeling: "¿Cómo te sientes hoy?",
     tap: "Toca y habla",
     listening: "Escuchando… toca para detener",
+    transcribing: "Transcribiendo tu grabación…",
+    transcriptInstruction: "Revisa y edita la transcripción. No se analizará hasta que la confirmes.",
+    confirmTranscript: "Usar esta transcripción y continuar",
+    rerecord: "Grabar de nuevo",
     typeInstead: "Escribir en su lugar",
     typePlaceholder: "Escribe cómo te sientes",
     heard: "Escuché:",
@@ -277,7 +288,6 @@ const copy: Record<Language, {
     submittingReport: "Enviando…",
     cancelReview: "Editar mi reporte",
     authLink: "Abrir inicio de sesión del participante",
-    voiceUnavailable: "La transcripción de voz aún no está conectada. Puedes escribir tu reporte.",
     analyzing: "Analizando tu reporte…",
     preparing: "Preparando los síntomas…",
     historyNotConnected: "El API actual para participantes no permite consultar reportes anteriores.",
@@ -295,6 +305,10 @@ const copy: Record<Language, {
     howFeeling: "您今天感觉怎么样？",
     tap: "点击并说话",
     listening: "正在聆听…点击停止",
+    transcribing: "正在转写录音…",
+    transcriptInstruction: "请检查并编辑转写内容。确认后才会进行分析。",
+    confirmTranscript: "使用此转写内容并继续",
+    rerecord: "重新录音",
     typeInstead: "改为打字",
     typePlaceholder: "请写下您的感受",
     heard: "我听到的是：",
@@ -355,7 +369,6 @@ const copy: Record<Language, {
     submittingReport: "正在提交…",
     cancelReview: "修改我的报告",
     authLink: "打开参与者登录页面",
-    voiceUnavailable: "语音转写尚未连接。您可以改为输入报告。",
     analyzing: "正在分析您的报告…",
     preparing: "正在整理症状…",
     historyNotConnected: "当前参与者 API 暂不支持查看以往报告。",
@@ -373,6 +386,10 @@ const copy: Record<Language, {
     howFeeling: "Hôm nay bạn cảm thấy thế nào?",
     tap: "Chạm và nói",
     listening: "Đang nghe… chạm để dừng",
+    transcribing: "Đang phiên âm bản ghi…",
+    transcriptInstruction: "Hãy xem lại và chỉnh sửa bản phiên âm. Nội dung chỉ được phân tích sau khi bạn xác nhận.",
+    confirmTranscript: "Dùng bản phiên âm này và tiếp tục",
+    rerecord: "Ghi âm lại",
     typeInstead: "Nhập bằng bàn phím",
     typePlaceholder: "Hãy viết bạn đang cảm thấy thế nào",
     heard: "Tôi đã nghe:",
@@ -433,7 +450,6 @@ const copy: Record<Language, {
     submittingReport: "Đang gửi…",
     cancelReview: "Sửa báo cáo của tôi",
     authLink: "Mở trang đăng nhập người tham gia",
-    voiceUnavailable: "Chưa kết nối tính năng chuyển giọng nói thành văn bản. Bạn có thể nhập báo cáo.",
     analyzing: "Đang phân tích báo cáo…",
     preparing: "Đang chuẩn bị thông tin triệu chứng…",
     historyNotConnected: "API dành cho người tham gia hiện chưa hỗ trợ xem báo cáo cũ.",
@@ -464,7 +480,6 @@ export default function ReportPage() {
   const [tab, setTab] = useState<Tab>("home");
   const [flow, setFlow] = useState<Flow>("idle");
   const [lang, setLang] = useState<Language>("es");
-  const [listening, setListening] = useState(false);
   const [typing, setTyping] = useState(false);
   const [story, setStory] = useState("");
   const [chatOpen, setChatOpen] = useState(false);
@@ -490,6 +505,7 @@ export default function ReportPage() {
   const notificationRequestRef = useRef<AbortController | null>(null);
 
   const L = copy[lang];
+  const recorder = useRecorder(lang);
 
   const loadNotifications = useCallback(async () => {
     notificationRequestRef.current?.abort();
@@ -564,12 +580,19 @@ export default function ReportPage() {
   }
 
   function toggleMic() {
-    setListening(false);
-    setReportError(L.voiceUnavailable);
+    if (recorder.status === "recording") {
+      recorder.stop();
+      return;
+    }
+    if (recorder.status === "processing" || reportActivity !== "idle") return;
+    recorder.reset();
+    setReportError(null);
     setAuthenticationBlocked(false);
+    void recorder.start();
   }
 
   function reset() {
+    recorder.reset();
     setFlow("idle");
     setStory("");
     setTyping(false);
@@ -829,13 +852,67 @@ export default function ReportPage() {
             <section className="flex flex-1 flex-col items-center justify-center gap-6">
               <h1 className="text-center text-3xl font-bold text-forest-800">{L.howFeeling}</h1>
               <MicHero
-                listening={listening}
+                listening={recorder.status === "recording"}
                 onClick={toggleMic}
-                label={listening ? L.listening : L.tap}
+                label={
+                  recorder.status === "recording"
+                    ? L.listening
+                    : recorder.status === "processing"
+                      ? L.transcribing
+                      : L.tap
+                }
+                disabled={
+                  !sessionReady ||
+                  recorder.status === "processing" ||
+                  reportActivity !== "idle"
+                }
               />
               <p aria-live="polite" className="text-center text-xl font-medium text-forest-800">
-                {listening ? L.listening : L.tap}
+                {recorder.status === "recording"
+                  ? L.listening
+                  : recorder.status === "processing"
+                    ? L.transcribing
+                    : L.tap}
               </p>
+              {recorder.status === "error" && (
+                <div className="flex w-full flex-col gap-3" role="alert">
+                  <p className="text-center text-sm text-red-900">{recorder.error}</p>
+                  <button className={secondaryBtn} onClick={toggleMic}>
+                    {L.rerecord}
+                  </button>
+                </div>
+              )}
+              {recorder.status === "review" && (
+                <div className="flex w-full flex-col gap-3">
+                  <label htmlFor="voice-transcript" className="text-sm font-medium text-forest-800">
+                    {L.transcriptInstruction}
+                  </label>
+                  <textarea
+                    id="voice-transcript"
+                    value={recorder.transcript}
+                    onChange={(event) => recorder.setTranscript(event.target.value)}
+                    rows={4}
+                    className={`${field} rounded-2xl p-4`}
+                    disabled={reportActivity !== "idle"}
+                  />
+                  <button
+                    type="button"
+                    className={primaryBtn}
+                    disabled={!recorder.transcript.trim() || reportActivity !== "idle"}
+                    onClick={() => void prepareParticipantReport(recorder.transcript, "voice")}
+                  >
+                    {L.confirmTranscript}
+                  </button>
+                  <button
+                    type="button"
+                    className={secondaryBtn}
+                    disabled={reportActivity !== "idle"}
+                    onClick={toggleMic}
+                  >
+                    {L.rerecord}
+                  </button>
+                </div>
+              )}
               {!typing ? (
                 <button className={secondaryBtn} onClick={() => setTyping(true)}>
                   {L.typeInstead}
@@ -855,7 +932,12 @@ export default function ReportPage() {
                   />
                   <button
                     className={primaryBtn}
-                    disabled={!story.trim() || reportActivity !== "idle"}
+                    disabled={
+                      !story.trim() ||
+                      reportActivity !== "idle" ||
+                      recorder.status === "recording" ||
+                      recorder.status === "processing"
+                    }
                     onClick={() => void prepareParticipantReport(story, "portal")}
                   >
                     {reportActivity === "analyzing"

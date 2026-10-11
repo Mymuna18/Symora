@@ -365,6 +365,38 @@ try {
     assert.equal(JSON.stringify(payload).includes("private provider"), false);
   });
 
+  await test("Gemini diagnostics expose only safe status, name, and category", async () => {
+    process.env.GEMINI_MODEL = "test-primary";
+    process.env.GEMINI_FALLBACK_MODEL = "";
+    setGeminiMock({
+      error: () => Object.assign(
+        new Error("private provider detail includes transcript and API key"),
+        { name: "ApiError", statusCode: 400 }
+      ),
+    });
+    const originalConsoleError = console.error;
+    const diagnostics = [];
+    console.error = (...args) => diagnostics.push(args);
+    let response;
+    try {
+      response = await post({
+        language: "vi",
+        transcript: "Tôi bị đau đầu.",
+      });
+    } finally {
+      console.error = originalConsoleError;
+    }
+
+    assert.equal(response.status, 502);
+    assert.equal(diagnostics.length, 1);
+    assert.deepEqual(diagnostics[0], [
+      "Gemini generateContent failed",
+      { httpStatus: 400, errorName: "ApiError", category: "invalid_request" },
+    ]);
+    assert.equal(JSON.stringify(diagnostics).includes("private provider detail"), false);
+    assert.equal(JSON.stringify(diagnostics).includes("Tôi bị đau đầu"), false);
+  });
+
   await test("production requests with a verified participant token reach Gemini", async () => {
     process.env.NODE_ENV = "production";
     setGeminiResponse(validGeminiOutput());

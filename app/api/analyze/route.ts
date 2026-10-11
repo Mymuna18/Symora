@@ -101,6 +101,38 @@ interface GeminiAnalysis {
 class PayloadTooLargeError extends Error {}
 class GeminiRequestBudgetError extends Error {}
 
+function geminiFailureDiagnostic(error: unknown, timedOut = false) {
+  const errorObject = typeof error === "object" && error !== null ? error : null;
+  const httpStatus = errorObject
+    ? "status" in errorObject && typeof errorObject.status === "number"
+      ? errorObject.status
+      : "statusCode" in errorObject && typeof errorObject.statusCode === "number"
+        ? errorObject.statusCode
+        : null
+    : null;
+  const rawName = errorObject && "name" in errorObject && typeof errorObject.name === "string"
+    ? errorObject.name
+    : "UnknownError";
+  const errorName = rawName.replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64) || "UnknownError";
+  const category = timedOut || /timeout|abort/i.test(errorName)
+    ? "timeout"
+    : httpStatus === 400
+      ? "invalid_request"
+      : httpStatus === 401 || httpStatus === 403
+        ? "authentication_or_permission"
+        : httpStatus === 429
+          ? "rate_limited"
+          : httpStatus !== null && httpStatus >= 500
+            ? "provider_failure"
+            : "request_failure";
+
+  return { httpStatus, errorName, category };
+}
+
+function logGeminiFailure(error: unknown, timedOut = false) {
+  console.error("Gemini generateContent failed", geminiFailureDiagnostic(error, timedOut));
+}
+
 function sleepWithinBudget(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
@@ -210,6 +242,10 @@ async function generateWithRetry(
           return await ai.models.generateContent(request);
         } catch (err: unknown) {
           lastErr = err;
+          logGeminiFailure(
+            err,
+            attemptTimeoutSignal.aborted || budgetController.signal.aborted
+          );
           if (
             budgetController.signal.aborted ||
             Date.now() >= deadline
@@ -427,6 +463,7 @@ async function analyze(req: Request) {
     });
   } catch (error) {
     if (error instanceof GeminiRequestBudgetError) {
+      logGeminiFailure(error, true);
       return Response.json(
         { error: "Analysis timed out. Please try again." },
         { status: 504 }

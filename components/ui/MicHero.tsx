@@ -1,4 +1,4 @@
-type Props = { listening: boolean; onClick: () => void; label: string };
+type Props = { listening: boolean; onClick: () => void; label: string; disabled?: boolean };
 
 // Bar heights in px. Left runs outer → inner, right runs inner → outer.
 const left = [10, 20, 34, 26, 48, 64, 44, 28, 16];
@@ -19,7 +19,7 @@ function Bar({ h, hue, i, active }: { h: number; hue: number; i: number; active:
   );
 }
 
-export function MicHero({ listening, onClick, label }: Props) {
+export function MicHero({ listening, onClick, label, disabled = false }: Props) {
   return (
     <div className="flex items-center justify-center gap-3">
       <div aria-hidden="true" className="flex items-center gap-1">
@@ -33,8 +33,11 @@ export function MicHero({ listening, onClick, label }: Props) {
         onClick={onClick}
         aria-pressed={listening}
         aria-label={label}
+        disabled={disabled}
         className={`flex h-32 w-32 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-leaf to-forest-900 shadow-lg transition-all duration-300 ease-out hover:ring-4 hover:ring-glow/70 hover:shadow-[0_0_28px_rgba(240,180,90,0.45)] ${
           listening ? "ring-4 ring-glow" : "ring-2 ring-white/60"
+        } disabled:cursor-not-allowed disabled:opacity-60 ${
+          disabled ? "hover:ring-2 hover:ring-white/60 hover:shadow-lg" : ""
         }`}
       >
         <svg viewBox="0 0 64 64" className="h-16 w-16" aria-hidden="true">
