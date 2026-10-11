@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { scryptSync } from "node:crypto";
+import { createHash, scryptSync } from "node:crypto";
 import { registerHooks } from "node:module";
 import { beforeEach, test } from "node:test";
 
 const participantId = "11111111-1111-4111-8111-111111111111";
 const reportId = "22222222-2222-4222-8222-222222222222";
 const password = "fictional-test-password-only";
+const coordinatorBearer = "fictional-coordinator-bearer-for-tests".padEnd(43, "x");
 const salt = "ab".repeat(16);
 const passwordHash = scryptSync(password, Buffer.from(salt, "hex"), 64).toString("hex");
 const origin = "http://localhost:3000";
@@ -35,12 +36,14 @@ const analyze = (await import("../app/api/analyze/route.ts")).POST;
 const prepare = (await import("../app/api/reports/prepare/route.ts")).POST;
 const submit = (await import("../app/api/reports/route.ts")).POST;
 const coordinator = (await import("../app/api/coordinator/reports/route.ts")).GET;
+const reviewStatus = (await import("../app/api/coordinator/reports/[reportId]/status/route.ts")).PATCH;
+const notifications = (await import("../app/api/participant/notifications/route.ts")).GET;
 
 function request(path, body, cookie, overrides = {}, method = "POST") {
   return new Request(`${origin}${path}`, { method,
     headers: { origin, "x-symora-csrf": "1", "content-type": "application/json",
       ...(cookie ? { cookie } : {}), ...overrides },
-    ...(method === "POST" && body !== undefined ? { body: JSON.stringify(body) } : {}) });
+    ...(!["GET", "HEAD"].includes(method) && body !== undefined ? { body: JSON.stringify(body) } : {}) });
 }
 
 async function login(role, cookie) {
@@ -61,8 +64,15 @@ beforeEach(() => {
     expiresAt: "2099-01-01T00:00:00.000Z",
     ...(role === "participant" ? { participantId } : { coordinatorId: "demo-coordinator" }),
   })));
+  process.env.SYMORA_COORDINATOR_AUTH_ENABLED = "true";
+  process.env.SYMORA_COORDINATORS = JSON.stringify([{
+    coordinatorId: "bearer-coordinator",
+    tokenSha256: createHash("sha256").update(coordinatorBearer).digest("hex"),
+    expiresAt: "2099-01-01T00:00:00.000Z",
+  }]);
   process.env.GEMINI_API_KEY = "fictional-key-only";
-  const state = { analysis, providerCalls: 0, sql: [], sessions: new Map(), rateLimits: new Map(), pool: null };
+  const state = { analysis, providerCalls: 0, sql: [], sessions: new Map(), rateLimits: new Map(),
+    reviewStatus: "submitted", reviewHistory: [], pool: null };
   const query = async (sql, values) => {
     state.sql.push({ sql, values });
     if (sql.includes("SELECT account_key_hash") && sql.includes("FROM browser_auth_sessions")) {
@@ -83,6 +93,9 @@ beforeEach(() => {
     }
     if (sql.includes("DELETE FROM browser_auth_sessions") && values?.length) state.sessions.delete(values[0]);
     if (sql.includes("WITH page")) return { rows: [{ id: reportId, participantCode: "DEMO-001", workflowStatus: "submitted", symptoms: [] }] };
+    if (sql.includes('AS "notificationId"')) return { rows: state.reviewHistory
+      .filter((row) => row.report_id === reportId && values[0] === participantId)
+      .map((row) => ({ notificationId: row.id, reportId: row.report_id, message: row.review_note, createdAt: row.created_at })) };
     if (sql.includes("SELECT code, display_name")) return { rows: [{ code: "headache", display_name: "Headache" }] };
     if (sql.includes("FROM participants")) return { rows: [{ id: participantId }] };
     if (sql.includes("SELECT id, code FROM symptoms")) return { rows: [{ id: "33333333-3333-4333-8333-333333333333", code: "headache" }] };
@@ -98,6 +111,23 @@ beforeEach(() => {
         accountKeyHash: values[1], role: values[2], configFingerprint: values[3],
         expires: new Date(values[5]).getTime(),
       });
+      if (sql.includes("SELECT workflow_status FROM public.reports")) {
+        return { rows: [{ workflow_status: state.reviewStatus }] };
+      }
+      if (sql.startsWith("UPDATE public.reports")) {
+        state.reviewStatus = values[1];
+        return { rows: [{ id: values[0], workflow_status: state.reviewStatus }] };
+      }
+      if (sql.startsWith("INSERT INTO public.review_history")) {
+        const review = {
+          id: "44444444-4444-4444-8444-444444444444", report_id: values[0],
+          reviewer_user_id: values[1], previous_workflow_status: values[2],
+          new_workflow_status: values[3], review_note: values[4],
+          created_at: new Date("2026-10-11T09:00:00.000Z"),
+        };
+        state.reviewHistory.push(review);
+        return { rows: [review] };
+      }
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK"
         || sql.includes("INSERT INTO browser_auth_sessions")
         || sql.includes("DELETE FROM browser_auth_sessions")) return { rows: [] };
@@ -148,6 +178,60 @@ test("actual routes enforce session role before touching private data or provide
   }
   assert.equal(globalThis.__browserWorkflow.providerCalls, 0);
   assert.equal(globalThis.__browserWorkflow.sql.some(({ sql }) => sql.includes("INSERT INTO reports")), false);
+});
+
+test("coordinator review and participant notifications use verified sessions and CSRF", async () => {
+  const participantCookie = await login("participant");
+  const coordinatorCookie = await login("coordinator");
+  const base = `/api/coordinator/reports/${reportId}/status`;
+
+  const noCsrf = await reviewStatus(request(base, { workflowStatus: "reviewed" }, coordinatorCookie,
+    { "x-symora-csrf": "" }), { params: Promise.resolve({ reportId }) });
+  assert.equal(noCsrf.status, 403);
+  const wrongOrigin = await reviewStatus(request(base, { workflowStatus: "reviewed" }, coordinatorCookie,
+    { origin: "https://attacker.invalid" }), { params: Promise.resolve({ reportId }) });
+  assert.equal(wrongOrigin.status, 403);
+  assert.equal(globalThis.__browserWorkflow.reviewHistory.length, 0);
+
+  const deniedParticipant = await reviewStatus(request(base, { workflowStatus: "reviewed" }, participantCookie),
+    { params: Promise.resolve({ reportId }) });
+  assert.equal(deniedParticipant.status, 403);
+  const unauthenticated = await reviewStatus(request(base, { workflowStatus: "reviewed" }),
+    { params: Promise.resolve({ reportId }) });
+  assert.equal(unauthenticated.status, 401);
+  assert.equal(globalThis.__browserWorkflow.reviewHistory.length, 0);
+
+  const changed = await reviewStatus(request(base, {
+    workflowStatus: "follow_up_requested",
+    reviewNote: "Please clarify when the fictional headache began.",
+  }, coordinatorCookie), { params: Promise.resolve({ reportId }) });
+  assert.equal(changed.status, 200, await changed.clone().text());
+  assert.equal(changed.headers.get("cache-control"), "no-store");
+  const changedBody = await changed.json();
+  assert.equal(changedBody.review.reviewerUserId, "demo-coordinator");
+  assert.equal(globalThis.__browserWorkflow.reviewHistory[0].reviewer_user_id, "demo-coordinator");
+
+  const feed = await notifications(request("/api/participant/notifications", undefined, participantCookie, {}, "GET"));
+  assert.equal(feed.status, 200);
+  const feedBody = await feed.json();
+  assert.deepEqual(feedBody, { notifications: [{
+    notificationId: "44444444-4444-4444-8444-444444444444",
+    reportId,
+    message: "Please clarify when the fictional headache began.",
+    createdAt: "2026-10-11T09:00:00.000Z",
+  }] });
+  assert.doesNotMatch(JSON.stringify(feedBody), /reviewer_user_id|demo-coordinator/);
+  assert.equal((await notifications(request("/api/participant/notifications", undefined, coordinatorCookie, {}, "GET"))).status, 403);
+});
+
+test("status route preserves existing coordinator bearer-token clients", async () => {
+  const response = await reviewStatus(request(`/api/coordinator/reports/${reportId}/status`,
+    { workflowStatus: "reviewed" }, undefined, {
+      authorization: `Bearer ${coordinatorBearer}`,
+      "x-symora-csrf": "",
+    }), { params: Promise.resolve({ reportId }) });
+  assert.equal(response.status, 200, await response.clone().text());
+  assert.equal((await response.json()).review.reviewerUserId, "bearer-coordinator");
 });
 
 test("every participant endpoint rejects cross-origin cookie writes before services", async () => {
