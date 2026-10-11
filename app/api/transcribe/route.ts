@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
+import { authenticateParticipantRequest, withPrivateResponse } from "../../../lib/request-auth.mjs";
+import { ReportError } from "../../../lib/report-errors.mjs";
 
 const client = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
 
@@ -7,7 +9,19 @@ const client = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
 const LANGS: Record<string, string> = { en: "en", es: "es", vi: "vi", zh: "zh" };
 const MAX_BYTES = 10 * 1024 * 1024;
 
-export async function POST(req: Request) {
+async function handler(req: Request): Promise<Response> {
+  // Same participant check as the other routes. It throws a ReportError
+  // (401 bad/missing credentials, 503 auth not configured).
+  try {
+    await authenticateParticipantRequest(req);
+  } catch (error) {
+    if (error instanceof ReportError) {
+      return NextResponse.json({ error: error.message, code: error.code }, { status: error.status });
+    }
+    // Fail closed on anything unexpected.
+    return NextResponse.json({ error: "Unauthorized", code: "UNAUTHORIZED" }, { status: 401 });
+  }
+
   if (!process.env.ELEVENLABS_API_KEY) {
     return NextResponse.json({ error: "Server not configured" }, { status: 500 });
   }
@@ -49,3 +63,5 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Transcription failed" }, { status: 502 });
   }
 }
+
+export const POST = withPrivateResponse(handler);
