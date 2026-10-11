@@ -1,14 +1,22 @@
 "use client";
 
-import { useMemo, useState, type FormEvent } from "react";
+import { startTransition, useEffect, useMemo, useState } from "react";
 import { mockReports } from "@/lib/mock";
+import {
+  appendChatMessage,
+  dailyChatKey,
+  readFollowUpState,
+  readChatMessages,
+  subscribeToChatMessages,
+  type ChatMessage,
+  writeFollowUpState,
+} from "@/lib/chat";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import type { Report, ReviewStatus } from "@/lib/types";
 
 type Section = "reports" | "participants" | "trial";
 type StatusF = "all" | ReviewStatus;
 type IntensityF = "all" | "high" | "medium" | "low";
-type ChatMsg = { from: "doctor" | "participant"; text: string; time: string; auto?: boolean };
 
 const langName = {
   en: "English",
@@ -114,8 +122,8 @@ export default function DashboardPage() {
   const [intensityF, setIntensityF] = useState<IntensityF>("all");
   const [query, setQuery] = useState("");
   const [assignee, setAssignee] = useState<Record<string, string>>({});
-  const [chats, setChats] = useState<Record<string, ChatMsg[]>>({});
-  const [draft, setDraft] = useState("");
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [today, setToday] = useState("");
 
   const filtered = useMemo(
     () =>
@@ -137,42 +145,47 @@ export default function DashboardPage() {
   const selected = filtered.find((r) => r.id === selectedId) ?? filtered[0];
   const needsReview = reports.filter((r) => r.status === "new").length;
 
-  // One chat per participant per day. A new day means a new key, so it starts empty.
-  const today = new Date().toLocaleDateString("en-CA");
-  const chatKey = selected ? `${selected.participantCode}:${today}` : "";
-  const messages = chats[chatKey] ?? [];
+  // One chat per participant per day.
+  const chatKey = selected && today ? dailyChatKey(selected.participantCode, today) : "";
+
+  useEffect(() => {
+    startTransition(() => {
+      setToday(new Date().toLocaleDateString("en-CA"));
+    });
+  }, []);
+
+  useEffect(() => {
+    const syncMessages = (next: ChatMessage[]) => setMessages(next);
+    syncMessages(readChatMessages(chatKey));
+    return subscribeToChatMessages(chatKey, syncMessages);
+  }, [chatKey]);
 
 function setStatus(status: ReviewStatus) {
-    if (!selected || selected.status === status) return;
+  if (!selected || !chatKey || !today || selected.status === status) return;
     // Placeholder: call PATCH /api/reports/[id] here, then update state
     setReports((rs) => rs.map((r) => (r.id === selected.id ? { ...r, status } : r)));
 
     const text = autoMessages[status];
     if (text) {
-        // Placeholder: send through the shared channel once one exists
-        const msg: ChatMsg = {
+        const msg: ChatMessage = {
         from: "doctor",
         text,
+        kind: status === "follow_up_requested" ? "follow_up_requested" : "reviewed",
         auto: true,
         time: new Date().toLocaleTimeString("en-US", { timeStyle: "short" }),
+        readByPatient: false,
         };
-        setChats((c) => ({ ...c, [chatKey]: [...(c[chatKey] ?? []), msg] }));
+        appendChatMessage(chatKey, msg);
+        if (status === "follow_up_requested") {
+          writeFollowUpState(selected.participantCode, {
+            ...readFollowUpState(selected.participantCode),
+            pending: true,
+            appointmentScheduled: false,
+            lastReminderDate: today,
+          });
+        }
     }
 }
-
-  function sendMessage(e: FormEvent) {
-    e.preventDefault();
-    const text = draft.trim();
-    if (!selected || !text) return;
-    // Placeholder: send through a shared real-time channel once one exists
-    const msg: ChatMsg = {
-      from: "doctor",
-      text,
-      time: new Date().toLocaleTimeString("en-US", { timeStyle: "short" }),
-    };
-    setChats((c) => ({ ...c, [chatKey]: [...(c[chatKey] ?? []), msg] }));
-    setDraft("");
-  }
 
   const actionBtn =
     "min-h-11 w-full whitespace-nowrap rounded-full bg-forest-800 px-4 py-2.5 text-center font-medium text-white transition-all duration-300 ease-out hover:bg-leaf hover:ring-2 hover:ring-glow/70 hover:shadow-lg";
@@ -479,7 +492,7 @@ function setStatus(status: ReviewStatus) {
                         Message {selected.participantCode}
                       </h3>
                       <span className="whitespace-nowrap text-xs text-muted">
-                        Clears daily · not saved
+                        Automated messages · same browser only
                       </span>
                     </div>
 
@@ -489,7 +502,7 @@ function setStatus(status: ReviewStatus) {
                     >
                       {messages.length === 0 ? (
                         <p className="m-auto text-sm text-muted">
-                          No messages today. Write one below.
+                          No automated messages today.
                         </p>
                       ) : (
                         messages.map((m, i) => (
@@ -513,26 +526,9 @@ function setStatus(status: ReviewStatus) {
                       )}
                     </div>
 
-                    <p className="px-4 pb-1 text-xs text-muted">
-                      Demo only: messages are not delivered to the participant yet. Not for
-                      emergencies.
+                    <p className="border-t border-forest-800/20 px-4 py-2 text-xs text-muted">
+                      Demo only: automated messages are stored in this browser. Not for emergencies.
                     </p>
-                    <form onSubmit={sendMessage} className="flex gap-2 border-t border-forest-800/20 p-3">
-                      <input
-                        value={draft}
-                        onChange={(e) => setDraft(e.target.value)}
-                        placeholder="Write a message in English"
-                        aria-label="Message"
-                        className="h-11 min-w-0 flex-1 rounded-full border border-forest-800/20 bg-white px-4 transition-all duration-300 ease-out hover:ring-2 hover:ring-glow/60"
-                      />
-                      <button
-                        type="submit"
-                        disabled={!draft.trim()}
-                        className="min-h-11 whitespace-nowrap rounded-full bg-forest-800 px-6 font-medium text-white transition-all duration-300 ease-out hover:bg-leaf hover:ring-2 hover:ring-glow/70 disabled:opacity-50"
-                      >
-                        Send
-                      </button>
-                    </form>
                   </section>
                 </>
               )}
