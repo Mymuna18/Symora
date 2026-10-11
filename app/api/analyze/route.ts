@@ -70,7 +70,6 @@ RULES:
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MAX_REQUEST_BYTES = 50 * 1024;
 const GEMINI_TIMEOUT_MS = 10000;
-export const runtime = "nodejs";
 
 interface GeminiSymptom {
   name: string;
