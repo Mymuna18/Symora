@@ -21,6 +21,19 @@ export class GoogleGenAI {
           ? mock.error(params)
           : mock.error;
         if (error) throw error;
+        if (mock.waitForAbort) {
+          await new Promise((resolve, reject) => {
+            const signal = params.config.abortSignal;
+            const rejectOnAbort = () => reject(
+              Object.assign(new Error("request aborted"), { name: "RequestAbortedError" })
+            );
+            if (signal.aborted) {
+              rejectOnAbort();
+            } else {
+              signal.addEventListener("abort", rejectOnAbort, { once: true });
+            }
+          });
+        }
         return {
           text: typeof mock.text === "function" ? mock.text(params) : mock.text,
         };
@@ -89,8 +102,8 @@ function setGeminiResponse(value) {
   };
 }
 
-function setGeminiMock({ text = "", error = null }) {
-  globalThis.__geminiMock = { text, error, calls: [] };
+function setGeminiMock({ text = "", error = null, waitForAbort = false }) {
+  globalThis.__geminiMock = { text, error, waitForAbort, calls: [] };
 }
 
 function validGeminiOutput() {
@@ -434,6 +447,26 @@ try {
     assert.equal(response.status, 200);
     assert.equal(globalThis.__geminiMock.calls.length, 2);
     assert.ok(globalThis.__geminiMock.calls.every((call) => call.model === "test-primary"));
+  });
+
+  await test("overall Gemini budget aborts in-flight request and returns a safe timeout", async () => {
+    process.env.GEMINI_MODEL = "test-primary";
+    process.env.GEMINI_FALLBACK_MODEL = "test-fallback";
+    setGeminiMock({ waitForAbort: true });
+    const nativeSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = (callback, delay, ...args) =>
+      nativeSetTimeout(callback, delay === 20000 ? 5 : delay, ...args);
+    let response;
+    try {
+      response = await post({ language: "en", transcript: "I have a headache" });
+    } finally {
+      globalThis.setTimeout = nativeSetTimeout;
+    }
+    const payload = await response.json();
+    assert.equal(response.status, 504);
+    assert.deepEqual(payload, { error: "Analysis timed out. Please try again." });
+    assert.equal(globalThis.__geminiMock.calls.length, 1);
+    assert.equal(globalThis.__geminiMock.calls[0].config.abortSignal.aborted, true);
   });
 
   await test("retryable primary-model failures proceed to the configured fallback", async () => {

@@ -1,5 +1,4 @@
 import { GoogleGenAI, Type, type GenerateContentParameters } from "@google/genai";
-import { NextResponse } from "next/server";
 import { authenticateDemoParticipant } from "../../../lib/demo-auth.mjs";
 import { ReportError } from "../../../lib/report-errors.mjs";
 
@@ -72,9 +71,9 @@ RULES:
 - language: output exactly the requested supported language code (en, es, vi, or zh), never the language name.
 - All other fields in English except source_excerpt and clarification.participant_language.`;
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MAX_REQUEST_BYTES = 50 * 1024;
 const GEMINI_TIMEOUT_MS = 10000;
+const GEMINI_REQUEST_BUDGET_MS = 20000;
 const GEMINI_MAX_ATTEMPTS_PER_MODEL = 2;
 const GEMINI_RETRY_DELAY_MS = 300;
 
@@ -99,6 +98,26 @@ interface GeminiAnalysis {
 }
 
 class PayloadTooLargeError extends Error {}
+class GeminiRequestBudgetError extends Error {}
+
+function sleepWithinBudget(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new GeminiRequestBudgetError());
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new GeminiRequestBudgetError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 async function readRequestText(request: Request): Promise<string> {
   const contentLength = request.headers.get("content-length");
@@ -172,52 +191,84 @@ async function generateWithRetry(
     models.push("gemini-2.5-flash");
   }
 
+  const deadline = Date.now() + GEMINI_REQUEST_BUDGET_MS;
+  const budgetController = new AbortController();
+  const budgetTimer = setTimeout(
+    () => budgetController.abort(),
+    GEMINI_REQUEST_BUDGET_MS
+  );
   let lastErr: unknown;
-  for (const model of models) {
-    for (let attempt = 0; attempt < GEMINI_MAX_ATTEMPTS_PER_MODEL; attempt++) {
-      try {
-        const request: GenerateContentParameters = {
-          ...params,
-          model,
-          config: {
-            ...params.config,
-            abortSignal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
-            httpOptions: {
-              ...params.config?.httpOptions,
-              timeout: GEMINI_TIMEOUT_MS,
+  try {
+    for (const model of models) {
+      for (let attempt = 0; attempt < GEMINI_MAX_ATTEMPTS_PER_MODEL; attempt++) {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0 || budgetController.signal.aborted) {
+          throw new GeminiRequestBudgetError();
+        }
+
+        const attemptTimeoutMs = Math.min(GEMINI_TIMEOUT_MS, remainingMs);
+        const attemptTimeoutSignal = AbortSignal.timeout(attemptTimeoutMs);
+        const abortSignal = AbortSignal.any([
+          budgetController.signal,
+          attemptTimeoutSignal,
+        ]);
+        try {
+          const request: GenerateContentParameters = {
+            ...params,
+            model,
+            config: {
+              ...params.config,
+              abortSignal,
+              httpOptions: {
+                ...params.config?.httpOptions,
+                timeout: attemptTimeoutMs,
+              },
             },
-          },
-        };
-        return await ai.models.generateContent(request);
-      } catch (err: unknown) {
-        lastErr = err;
-        const status = typeof err === "object" && err !== null
-          ? "status" in err && typeof err.status === "number"
-            ? err.status
-            : "statusCode" in err && typeof err.statusCode === "number"
-              ? err.statusCode
-              : undefined
-          : undefined;
-        const name = typeof err === "object" && err !== null && "name" in err
-          ? err.name
-          : undefined;
-        const code = typeof err === "object" && err !== null && "code" in err
-          ? err.code
-          : undefined;
-        const networkTimeout =
-          name === "RequestTimeoutError" ||
-          name === "TimeoutError" ||
-          (typeof code === "string" &&
-            ["ETIMEDOUT", "ECONNABORTED", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT"]
-              .includes(code.toUpperCase()));
-        const retryable = [429, 500, 502, 503].includes(status ?? -1) || networkTimeout;
-        if (!retryable) throw err;
-        if (attempt + 1 === GEMINI_MAX_ATTEMPTS_PER_MODEL) break;
-        await sleep(GEMINI_RETRY_DELAY_MS);
+          };
+          return await ai.models.generateContent(request);
+        } catch (err: unknown) {
+          lastErr = err;
+          if (
+            budgetController.signal.aborted ||
+            Date.now() >= deadline
+          ) {
+            throw new GeminiRequestBudgetError();
+          }
+
+          const status = typeof err === "object" && err !== null
+            ? "status" in err && typeof err.status === "number"
+              ? err.status
+              : "statusCode" in err && typeof err.statusCode === "number"
+                ? err.statusCode
+                : undefined
+            : undefined;
+          const name = typeof err === "object" && err !== null && "name" in err
+            ? err.name
+            : undefined;
+          const code = typeof err === "object" && err !== null && "code" in err
+            ? err.code
+            : undefined;
+          const networkTimeout =
+            attemptTimeoutSignal.aborted ||
+            name === "RequestTimeoutError" ||
+            name === "TimeoutError" ||
+            (typeof code === "string" &&
+              ["ETIMEDOUT", "ECONNABORTED", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT"]
+                .includes(code.toUpperCase()));
+          const retryable = [429, 500, 502, 503].includes(status ?? -1) || networkTimeout;
+          if (!retryable) throw err;
+          if (attempt + 1 === GEMINI_MAX_ATTEMPTS_PER_MODEL) break;
+
+          const retryDelayMs = Math.min(GEMINI_RETRY_DELAY_MS, deadline - Date.now());
+          if (retryDelayMs <= 0) throw new GeminiRequestBudgetError();
+          await sleepWithinBudget(retryDelayMs, budgetController.signal);
+        }
       }
     }
+    throw lastErr ?? new Error("Gemini request failed");
+  } finally {
+    clearTimeout(budgetTimer);
   }
-  throw lastErr ?? new Error("Gemini request failed");
 }
 
 function validateGeminiOutput(
@@ -275,7 +326,7 @@ export async function POST(req: Request) {
   } catch (error) {
     if (error instanceof ReportError) {
       const unauthorized = error.status === 401;
-      return NextResponse.json(
+      return Response.json(
         { error: unauthorized ? "Authentication required" : "Authentication unavailable" },
         {
           status: error.status,
@@ -286,14 +337,14 @@ export async function POST(req: Request) {
         }
       );
     }
-    return NextResponse.json(
+    return Response.json(
       { error: "Authentication failed" },
       { status: 500, headers: { "Cache-Control": "no-store" } }
     );
   }
 
   if (!checkRateLimit()) {
-    return NextResponse.json({ error: "Rate limit exceeded" }, { status: 429 });
+    return Response.json({ error: "Rate limit exceeded" }, { status: 429 });
   }
 
   let rawText: string;
@@ -301,42 +352,42 @@ export async function POST(req: Request) {
     rawText = await readRequestText(req);
   } catch (error) {
     if (error instanceof PayloadTooLargeError) {
-      return NextResponse.json({ error: "Payload exceeds 50KB limit" }, { status: 413 });
+      return Response.json({ error: "Payload exceeds 50KB limit" }, { status: 413 });
     }
-    return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+    return Response.json({ error: "Invalid request body" }, { status: 400 });
   }
 
   let body: unknown;
   try {
     body = JSON.parse(rawText);
   } catch {
-    return NextResponse.json({ error: "Invalid JSON payload" }, { status: 400 });
+    return Response.json({ error: "Invalid JSON payload" }, { status: 400 });
   }
 
   if (!body || typeof body !== "object" || Array.isArray(body)) {
-    return NextResponse.json({ error: "Request body must be a JSON object" }, { status: 400 });
+    return Response.json({ error: "Request body must be a JSON object" }, { status: 400 });
   }
 
   const { transcript, language } = body as Record<string, unknown>;
 
   if (!isSupportedLanguage(language)) {
-    return NextResponse.json(
+    return Response.json(
       { error: `Unsupported language. Allowed: ${SUPPORTED_LANGUAGES.join(", ")}` },
       { status: 400 }
     );
   }
 
   if (!transcript || typeof transcript !== "string" || !transcript.trim()) {
-    return NextResponse.json({ error: "Transcript must be a non-empty string" }, { status: 400 });
+    return Response.json({ error: "Transcript must be a non-empty string" }, { status: 400 });
   }
 
   if (transcript.length > 5000) {
-    return NextResponse.json({ error: "Transcript exceeds 5000 characters" }, { status: 400 });
+    return Response.json({ error: "Transcript exceeds 5000 characters" }, { status: 400 });
   }
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
+    return Response.json({ error: "Server configuration error" }, { status: 500 });
   }
 
   try {
@@ -354,18 +405,18 @@ export async function POST(req: Request) {
     });
 
     if (!res.text) {
-      return NextResponse.json({ error: "Empty analysis generated" }, { status: 502 });
+      return Response.json({ error: "Empty analysis generated" }, { status: 502 });
     }
 
     let analysis: unknown;
     try {
       analysis = JSON.parse(res.text);
     } catch {
-      return NextResponse.json({ error: "Malformed model response JSON" }, { status: 502 });
+      return Response.json({ error: "Malformed model response JSON" }, { status: 502 });
     }
 
     if (!validateGeminiOutput(analysis, language)) {
-      return NextResponse.json({ error: "Output failed strict schema validation" }, { status: 502 });
+      return Response.json({ error: "Output failed strict schema validation" }, { status: 502 });
     }
 
     const norm = (s: string) => s.normalize("NFC").toLowerCase().replace(/[\p{P}\p{S}\s]+/gu, "");
@@ -378,13 +429,19 @@ export async function POST(req: Request) {
       return { ...s, verified_excerpt: excerptMatches };
     });
 
-    return NextResponse.json({
+    return Response.json({
       ...analysis,
       language,
       requires_manual_review: needsReview,
       demo_fallback: false,
     });
-  } catch {
-    return NextResponse.json({ error: "Analysis processing failed" }, { status: 502 });
+  } catch (error) {
+    if (error instanceof GeminiRequestBudgetError) {
+      return Response.json(
+        { error: "Analysis timed out. Please try again." },
+        { status: 504 }
+      );
+    }
+    return Response.json({ error: "Analysis processing failed" }, { status: 502 });
   }
 }
