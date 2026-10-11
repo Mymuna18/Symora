@@ -1,8 +1,8 @@
 import { getPool } from "../../../../lib/db.mjs";
-import { authenticateCoordinator } from "../../../../lib/coordinator-auth.mjs";
+import { authenticateCoordinatorRequest, withPrivateResponse } from "../../../../lib/request-auth.mjs";
 import { createCoordinatorReportsHandler, listCoordinatorReports } from "../../../../lib/coordinator-reports.mjs";
 
-export const GET = createCoordinatorReportsHandler({
-  authenticate: authenticateCoordinator,
+export const GET = withPrivateResponse(createCoordinatorReportsHandler({
+  authenticate: authenticateCoordinatorRequest,
   list: (pagination) => listCoordinatorReports(getPool, pagination),
-});
+}));
