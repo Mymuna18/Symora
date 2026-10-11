@@ -61,6 +61,9 @@ const SYSTEM = `You convert a clinical trial participant's spoken transcript int
 RULES:
 - Extract ONLY what the speaker actually said. Never invent or infer dates, severity, medications, causes, or diagnoses.
 - Include every distinct symptom phrase, in transcript order, with one symptom object per phrase. Do not omit phrases joined by "and", commas, or equivalent wording, and never substitute a different symptom.
+- Report EVERY distinct symptom the speaker mentions, even when joined by words like and, also, 还, 也, 和, or commas. Never merge, drop, or replace symptoms.
+- Translate symptom words exactly: 头晕 = dizziness (NOT headache), 头痛 = headache, 肚子疼 = stomach pain.
+- When a symptom matches one of these, use exactly this English name: headache, dizziness, stomach pain, nausea, fatigue. Otherwise use a short plain English name. Never use synonyms like stomachache or tummy ache for these.
 - If a detail was not stated, use null (or [] for medications).
 - onset_text: the speaker's own timing words, translated into ENGLISH.
 - intensity: the speaker's own words or number, translated into ENGLISH. null if not given.
