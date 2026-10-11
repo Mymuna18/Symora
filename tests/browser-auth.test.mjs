@@ -420,6 +420,48 @@ test("browser sessions and login fail closed when PostgreSQL is unavailable", as
   await assert.rejects(authWithUnavailableStore.logout(request({ headers: { cookie } })), errorIs(503, "BROWSER_AUTH_UNAVAILABLE"));
 });
 
+test("login database diagnostics log only a safe operation stage and failure category", async () => {
+  const cases = [
+    { stage: "rate-limit-query", code: "42P01", category: "missing-table" },
+    { stage: "rate-limit-query", code: "42501", category: "permission" },
+    { stage: "rate-limit-query", code: "ECONNREFUSED", category: "database-connection" },
+    { stage: "rate-limit-query", code: "XX000", category: "database-query" },
+    { stage: "session-creation", code: "42P01", category: "missing-table" },
+    { stage: "session-creation", code: "42501", category: "permission" },
+  ];
+  for (const { stage, code, category } of cases) {
+    const store = createTestStore();
+    const privateDiagnostic = "synthetic database credentials and private account details";
+    if (stage === "rate-limit-query") {
+      store.consumeRateLimit = async () => {
+        const error = new Error(privateDiagnostic);
+        error.code = code;
+        throw error;
+      };
+    } else {
+      store.replaceSession = async () => {
+        const error = new Error(privateDiagnostic);
+        error.code = code;
+        throw error;
+      };
+    }
+    const auth = createBrowserAuth({ store, now: () => now, readConfig: config });
+    const entries = [];
+    const originalError = console.error;
+    console.error = (...args) => entries.push(args);
+    try {
+      await assert.rejects(auth.login(request(), "participant"), errorIs(503, "BROWSER_AUTH_UNAVAILABLE"));
+    } finally {
+      console.error = originalError;
+    }
+    assert.deepEqual(entries, [[
+      "[symora] browser auth database operation failed",
+      { stage, category },
+    ]]);
+    assert.doesNotMatch(JSON.stringify(entries), /synthetic database credentials|private account details|password/i);
+  }
+});
+
 test("login rate limits cannot be bypassed by changing forwarded headers", async () => {
   const { auth, advance } = fixture();
   for (let i = 0; i < 5; i++) {
