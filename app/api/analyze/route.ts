@@ -60,6 +60,7 @@ const schema = {
 const SYSTEM = `You convert a clinical trial participant's spoken transcript into a structured English record.
 RULES:
 - Extract ONLY what the speaker actually said. Never invent or infer dates, severity, medications, causes, or diagnoses.
+- Include every distinct symptom phrase, in transcript order, with one symptom object per phrase. Do not omit phrases joined by "and", commas, or equivalent wording, and never substitute a different symptom.
 - If a detail was not stated, use null (or [] for medications).
 - onset_text: the speaker's own timing words, translated into ENGLISH.
 - intensity: the speaker's own words or number, translated into ENGLISH. null if not given.
@@ -71,7 +72,6 @@ RULES:
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MAX_REQUEST_BYTES = 50 * 1024;
 const GEMINI_TIMEOUT_MS = 10000;
-export const runtime = "nodejs";
 
 interface GeminiSymptom {
   name: string;

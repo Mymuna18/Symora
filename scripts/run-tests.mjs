@@ -157,29 +157,35 @@ try {
     const cases = [
       {
         language: "en",
-        transcript: "I have a headache",
+        transcript: "I have a headache and feel dizzy since Tuesday",
         excerpt: "a headache",
         name: "headache",
-        translation: "I have a headache.",
-        onset: null,
+        secondExcerpt: "feel dizzy",
+        secondName: "dizziness",
+        translation: "I have a headache and feel dizzy since Tuesday.",
+        onset: "Tuesday",
         participantQuestion: "What makes the headache better?",
       },
       {
         language: "vi",
-        transcript: "Tôi bị đau bụng từ hôm qua",
+        transcript: "Tôi bị đau bụng và chóng mặt từ thứ Ba",
         excerpt: "đau bụng",
         name: "stomach pain",
-        translation: "I have had stomach pain since yesterday.",
-        onset: "yesterday",
+        secondExcerpt: "chóng mặt",
+        secondName: "dizziness",
+        translation: "I have stomach pain and dizziness since Tuesday.",
+        onset: "Tuesday",
         participantQuestion: "Điều gì làm cơn đau bụng đỡ hơn?",
       },
       {
         language: "zh",
-        transcript: "我从昨天开始头疼",
-        excerpt: "头疼",
-        name: "headache",
-        translation: "I have had a headache since yesterday.",
-        onset: "yesterday",
+        transcript: "我从星期二开始肚子疼，还觉得头晕",
+        excerpt: "肚子疼",
+        name: "stomach pain",
+        secondExcerpt: "头晕",
+        secondName: "dizziness",
+        translation: "I have had stomach pain since Tuesday and also feel dizzy.",
+        onset: "Tuesday",
         participantQuestion: "什么能缓解头痛？",
       },
     ];
@@ -189,13 +195,13 @@ try {
         language: item.language,
         english_translation: item.translation,
         summary: item.translation,
-        symptoms: [{
-          name: item.name,
+        symptoms: [item.name, item.secondName].map((name, index) => ({
+          name,
           onset_text: item.onset,
           intensity: null,
           ongoing: null,
-          source_excerpt: item.excerpt,
-        }],
+          source_excerpt: index === 0 ? item.excerpt : item.secondExcerpt,
+        })),
         medications_mentioned: [],
         clarification: {
           english: "What makes the symptom better?",
@@ -211,9 +217,11 @@ try {
       assert.equal(response.status, 200, item.language);
       assert.equal(payload.language, item.language);
       assert.equal(payload.english_translation, item.translation);
+      assert.equal(payload.symptoms.length, 2);
       assert.equal(payload.symptoms[0].name, item.name);
       assert.equal(payload.symptoms[0].onset_text, item.onset);
-      assert.equal(payload.symptoms[0].verified_excerpt, true);
+      assert.equal(payload.symptoms[1].name, item.secondName);
+      assert.equal(payload.symptoms.every((symptom) => symptom.verified_excerpt), true);
       assert.equal(payload.clarification.participant_language, item.participantQuestion);
       assert.deepEqual(payload.medications_mentioned, []);
     }
