@@ -37,7 +37,11 @@ test("pool creation is lazy and uses bounded connection settings", () => {
 for (const missing of [null, "", " \t\n"]) {
   test(`missing configuration fails before constructing a pool (${JSON.stringify(missing)})`, () => {
     const { db, instances } = setup(missing);
-    assert.throws(() => db.getPool(), /DATABASE_URL must be configured/);
+    assert.throws(() => db.getPool(), (error) => {
+      assert.match(error.message, /DATABASE_URL must be configured/);
+      assert.equal(error.code, "SYMORA_DATABASE_CONNECTION");
+      return true;
+    });
     assert.equal(instances.length, 0);
   });
 }
@@ -57,7 +61,7 @@ test("idle connection errors are handled without leaking error or client details
   assert.doesNotThrow(() => pool.emit("error", new Error("FAKE_SECRET"), { password: "FAKE_SECRET" }));
   assert.equal(errors.length, 1);
   assert.equal(errors[0].length, 1);
-  assert.match(errors[0][0], /idle connection failed/);
+  assert.match(errors[0][0], /idle connection failed \(category: database-connection\)/);
   assert.doesNotMatch(JSON.stringify(errors), /FAKE_SECRET/);
   assert.equal(db.getPool(), pool);
 });
