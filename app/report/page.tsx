@@ -1,5 +1,7 @@
 "use client";
 
+import { BrandHeader } from "@/components/ui/BrandHeader";
+import { SignOutButton } from "@/components/ui/SignOutButton";
 import { startTransition, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
@@ -127,6 +129,7 @@ const copy: Record<Language, {
   reportId: string;
   signOut: string;
   signingOut: string;
+  signOutError: string;
   checkingSession: string;
   sessionRequired: string;
   sessionExpired: string;
@@ -205,6 +208,7 @@ const copy: Record<Language, {
     checkingSession: "Checking session…",
     sessionRequired: "Sign in with a participant account to continue.",
     sessionExpired: "Your session has expired. Sign in again to continue.",
+    signOutError: "Sign out failed. Please try again.",
   },
   es: {
     tabs: { home: "Inicio", profile: "Perfil", past: "Reportes anteriores" },
@@ -280,6 +284,7 @@ const copy: Record<Language, {
     checkingSession: "Verificando sesión…",
     sessionRequired: "Inicia sesión con una cuenta de participante para continuar.",
     sessionExpired: "Tu sesión venció. Inicia sesión otra vez para continuar.",
+    signOutError: "No se pudo cerrar la sesión. Inténtalo de nuevo.",
   },
   zh: {
     tabs: { home: "首页", profile: "我的资料", past: "以往报告" },
@@ -355,6 +360,7 @@ const copy: Record<Language, {
     checkingSession: "正在检查登录状态…",
     sessionRequired: "请使用参与者账户登录后继续。",
     sessionExpired: "登录已过期。请重新登录后继续。",
+    signOutError: "退出失败，请重试。",
   },
   vi: {
     tabs: { home: "Trang chủ", profile: "Hồ sơ", past: "Báo cáo cũ" },
@@ -430,6 +436,7 @@ const copy: Record<Language, {
     checkingSession: "Đang kiểm tra phiên đăng nhập…",
     sessionRequired: "Vui lòng đăng nhập bằng tài khoản người tham gia để tiếp tục.",
     sessionExpired: "Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại để tiếp tục.",
+    signOutError: "Đăng xuất không thành công. Vui lòng thử lại.",
   },
 };
 
@@ -441,17 +448,7 @@ const primaryBtn = `${big} bg-forest-800 text-white hover:bg-leaf hover:ring-2 h
 const secondaryBtn = `${big} border border-forest-800/30 bg-white/70 text-forest-800 hover:bg-white hover:ring-2 hover:ring-glow/60`;
 const field =
   "w-full border border-forest-800/25 bg-white/90 text-lg transition-all duration-300 ease-out hover:ring-2 hover:ring-glow/60";
-function Header() {
-  return (
-    <header className="flex items-center gap-3 bg-forest-950 px-6 py-2 text-white">
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img src="/symora-emblem.svg" alt="" className="h-9 w-9" />
-      <p className="font-[family-name:var(--font-fraunces)] text-3xl font-semibold leading-none tracking-wide">
-        Symora
-      </p>
-    </header>
-  );
-}
+
 
 export default function ReportPage() {
   const router = useRouter();
@@ -811,7 +808,7 @@ export default function ReportPage() {
   if (!sessionReady) {
     return (
       <div className={page}>
-        <Header />
+        <BrandHeader/>
         <main className="flex flex-1 items-center justify-center p-4">
           <p role="status" className={`rounded-2xl p-5 text-center text-forest-800 ${glass}`}>
             Checking your session…
@@ -825,7 +822,7 @@ export default function ReportPage() {
   if (onboard !== "done") {
     return (
       <div className={page}>
-        <Header />
+        <BrandHeader/>
         <div className="flex flex-1 p-3">
           <main className={`mx-auto flex w-full max-w-md flex-col gap-5 rounded-3xl p-6 ${glass}`}>
             {onboard === "language" && (
@@ -880,7 +877,7 @@ export default function ReportPage() {
   // ---------- Main app with side tabs ----------
   return (
     <div className={page}>
-      <Header />
+      <BrandHeader/>
       <div className="flex flex-1 flex-col gap-3 p-3 md:flex-row">
         <SideTabs tab={tab} onChange={setTab} labels={L.tabs} />
 
@@ -1026,6 +1023,12 @@ export default function ReportPage() {
             <section className="flex flex-col gap-6">
               <h1 className="text-3xl font-bold text-forest-800">{L.profileTitle}</h1>
               <fieldset>
+                <hr className="border-t border-forest-800/20" />
+                  <SignOutButton 
+                    label={L.signOut} 
+                    busyLabel={L.signingOut} 
+                    errorLabel={L.signOutError} 
+                  />
                 <legend className="mb-2 text-lg font-medium text-forest-800">{L.language}</legend>
                 <div className="flex flex-col gap-3">
                   {langOptions.map((o) => (

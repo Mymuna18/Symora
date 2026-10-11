@@ -32,7 +32,7 @@ const icons: Record<Tab, ReactNode> = {
   ),
 };
 
-const order: Tab[] = ["home", "profile", "past"];
+const order: Tab[] = ["home", "profile"];
 
 export function SideTabs({ tab, onChange, labels }: Props) {
   return (
