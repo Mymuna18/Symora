@@ -14,7 +14,7 @@ const LANG_NAMES: Record<SupportedLanguage, string> = {
 const schema = {
   type: Type.OBJECT,
   properties: {
-    language: { type: Type.STRING },
+    language: { type: Type.STRING, enum: [...SUPPORTED_LANGUAGES] },
     english_translation: { type: Type.STRING },
     summary: { type: Type.STRING },
     symptoms: {
@@ -63,7 +63,8 @@ RULES:
 - intensity: the speaker's own words or number, translated into ENGLISH. null if not given.
 - source_excerpt: an exact quote from the ORIGINAL transcript supporting each symptom.
 - clarification: ask ONE short question about the most important missing detail, in English and participant's language. null if nothing missing.
-- All fields in English except source_excerpt and clarification.participant_language.`;
+- language: output exactly the requested supported language code (en, es, vi, or zh), never the language name.
+- All other fields in English except source_excerpt and clarification.participant_language.`;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MAX_REQUEST_BYTES = 50 * 1024;
