@@ -1,5 +1,7 @@
 import { GoogleGenAI, Type, type GenerateContentParameters } from "@google/genai";
 import { NextResponse } from "next/server";
+import { authenticateDemoParticipant } from "../../../lib/demo-auth.mjs";
+import { ReportError } from "../../../lib/report-errors.mjs";
 
 const SUPPORTED_LANGUAGES = ["en", "es", "vi", "zh"] as const;
 type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
@@ -69,6 +71,7 @@ RULES:
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MAX_REQUEST_BYTES = 50 * 1024;
 const GEMINI_TIMEOUT_MS = 10000;
+export const runtime = "nodejs";
 
 interface GeminiSymptom {
   name: string;
@@ -249,10 +252,25 @@ function isSupportedLanguage(language: unknown): language is SupportedLanguage {
 }
 
 export async function POST(req: Request) {
-  if (process.env.NODE_ENV === "production") {
+  try {
+    authenticateDemoParticipant(req);
+  } catch (error) {
+    if (error instanceof ReportError) {
+      const unauthorized = error.status === 401;
+      return NextResponse.json(
+        { error: unauthorized ? "Authentication required" : "Authentication unavailable" },
+        {
+          status: error.status,
+          headers: {
+            "Cache-Control": "no-store",
+            ...(unauthorized ? { "WWW-Authenticate": "Bearer" } : {}),
+          },
+        }
+      );
+    }
     return NextResponse.json(
-      { error: "Authentication integration is not configured" },
-      { status: 503 }
+      { error: "Authentication failed" },
+      { status: 500, headers: { "Cache-Control": "no-store" } }
     );
   }
 
