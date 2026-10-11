@@ -2,7 +2,6 @@ import { authenticateDemoParticipant } from "../../../../lib/demo-auth.mjs";
 import { getPool } from "../../../../lib/db.mjs";
 import { createReportPreparationHandler } from "../../../../lib/report-analysis.mjs";
 
-export const runtime = "nodejs";
 
 export const POST = createReportPreparationHandler({
   authenticate: authenticateDemoParticipant,
