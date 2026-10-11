@@ -75,6 +75,8 @@ RULES:
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MAX_REQUEST_BYTES = 50 * 1024;
 const GEMINI_TIMEOUT_MS = 10000;
+const GEMINI_MAX_ATTEMPTS_PER_MODEL = 2;
+const GEMINI_RETRY_DELAY_MS = 300;
 
 interface GeminiSymptom {
   name: string;
@@ -172,7 +174,7 @@ async function generateWithRetry(
 
   let lastErr: unknown;
   for (const model of models) {
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < GEMINI_MAX_ATTEMPTS_PER_MODEL; attempt++) {
       try {
         const request: GenerateContentParameters = {
           ...params,
@@ -189,16 +191,29 @@ async function generateWithRetry(
         return await ai.models.generateContent(request);
       } catch (err: unknown) {
         lastErr = err;
-        const status =
-          typeof err === "object" && err !== null && "status" in err
+        const status = typeof err === "object" && err !== null
+          ? "status" in err && typeof err.status === "number"
             ? err.status
-            : typeof err === "object" && err !== null && "code" in err
-              ? err.code
-              : undefined;
-        const retryable = status === 503 || status === 429 || status === 500;
+            : "statusCode" in err && typeof err.statusCode === "number"
+              ? err.statusCode
+              : undefined
+          : undefined;
+        const name = typeof err === "object" && err !== null && "name" in err
+          ? err.name
+          : undefined;
+        const code = typeof err === "object" && err !== null && "code" in err
+          ? err.code
+          : undefined;
+        const networkTimeout =
+          name === "RequestTimeoutError" ||
+          name === "TimeoutError" ||
+          (typeof code === "string" &&
+            ["ETIMEDOUT", "ECONNABORTED", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT"]
+              .includes(code.toUpperCase()));
+        const retryable = [429, 500, 502, 503].includes(status ?? -1) || networkTimeout;
         if (!retryable) throw err;
-        if (attempt === 2) break;
-        await sleep(800 * 2 ** attempt);
+        if (attempt + 1 === GEMINI_MAX_ATTEMPTS_PER_MODEL) break;
+        await sleep(GEMINI_RETRY_DELAY_MS);
       }
     }
   }

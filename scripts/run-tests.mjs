@@ -368,6 +368,74 @@ try {
     process.env.NODE_ENV = "test";
   });
 
+  await test("HTTP 502 from the primary model is retried once", async () => {
+    process.env.GEMINI_MODEL = "test-primary";
+    process.env.GEMINI_FALLBACK_MODEL = "";
+    let attempts = 0;
+    setGeminiMock({
+      error: () => {
+        attempts++;
+        return attempts === 1
+          ? Object.assign(new Error("temporary failure"), { statusCode: 502 })
+          : null;
+      },
+      text: JSON.stringify({
+        ...validGeminiOutput(),
+        language: "en",
+        english_translation: "I have a headache.",
+        summary: "Headache.",
+        symptoms: [{
+          name: "headache",
+          onset_text: null,
+          intensity: null,
+          ongoing: null,
+          source_excerpt: "a headache",
+        }],
+        clarification: null,
+      }),
+    });
+    const response = await post({ language: "en", transcript: "I have a headache" });
+    const payload = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(payload.symptoms[0].name, "headache");
+    assert.deepEqual(globalThis.__geminiMock.calls.map((call) => call.model), [
+      "test-primary",
+      "test-primary",
+    ]);
+  });
+
+  await test("network timeouts are retried once", async () => {
+    process.env.GEMINI_MODEL = "test-primary";
+    process.env.GEMINI_FALLBACK_MODEL = "";
+    let attempts = 0;
+    setGeminiMock({
+      error: () => {
+        attempts++;
+        return attempts === 1
+          ? Object.assign(new Error("request timed out"), { name: "RequestTimeoutError" })
+          : null;
+      },
+      text: JSON.stringify({
+        ...validGeminiOutput(),
+        language: "en",
+        english_translation: "I have a headache.",
+        summary: "Headache.",
+        symptoms: [{
+          name: "headache",
+          onset_text: null,
+          intensity: null,
+          ongoing: null,
+          source_excerpt: "a headache",
+        }],
+        clarification: null,
+      }),
+    });
+    const response = await post({ language: "en", transcript: "I have a headache" });
+    assert.equal(response.status, 200);
+    assert.equal(globalThis.__geminiMock.calls.length, 2);
+    assert.ok(globalThis.__geminiMock.calls.every((call) => call.model === "test-primary"));
+  });
+
   await test("retryable primary-model failures proceed to the configured fallback", async () => {
     process.env.GEMINI_MODEL = "test-primary";
     process.env.GEMINI_FALLBACK_MODEL = "test-fallback";
@@ -401,9 +469,28 @@ try {
     const payload = await response.json();
     assert.equal(response.status, 200);
     assert.equal(payload.symptoms[0].name, "headache");
+    assert.equal(payload.symptoms[0].verified_excerpt, true);
     assert.deepEqual(
       globalThis.__geminiMock.calls.map((call) => call.model),
-      ["test-primary", "test-primary", "test-primary", "test-fallback"]
+      ["test-primary", "test-primary", "test-fallback"]
+    );
+    assert.equal(globalThis.__geminiMock.calls[2].config.responseSchema.type, "OBJECT");
+  });
+
+  await test("complete Gemini failure returns a safe structured error", async () => {
+    process.env.GEMINI_MODEL = "test-primary";
+    process.env.GEMINI_FALLBACK_MODEL = "test-fallback";
+    setGeminiMock({
+      error: () => Object.assign(new Error("provider secret detail"), { status: 503 }),
+    });
+    const response = await post({ language: "es", transcript: "me duele el estómago" });
+    const payload = await response.json();
+    assert.equal(response.status, 502);
+    assert.deepEqual(payload, { error: "Analysis processing failed" });
+    assert.equal(JSON.stringify(payload).includes("provider secret detail"), false);
+    assert.deepEqual(
+      globalThis.__geminiMock.calls.map((call) => call.model),
+      ["test-primary", "test-primary", "test-fallback", "test-fallback"]
     );
   });
 
