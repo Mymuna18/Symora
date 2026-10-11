@@ -39,6 +39,27 @@ function followUpStorageKey(participantCode: string) {
   return `symora:follow-up:${participantCode}`;
 }
 
+export function clearParticipantChatData(participantCode: string) {
+  const prefix = `symora:chat:${participantCode}:`;
+  try {
+    const removedKeys: string[] = [];
+    for (let index = localStorage.length - 1; index >= 0; index--) {
+      const key = localStorage.key(index);
+      if (key?.startsWith(prefix)) {
+        localStorage.removeItem(key);
+        removedKeys.push(key);
+      }
+    }
+    localStorage.removeItem(followUpStorageKey(participantCode));
+    removedKeys.forEach((key) => {
+      window.dispatchEvent(new CustomEvent(CHAT_EVENT, { detail: key.slice("symora:chat:".length) }));
+    });
+  } catch {
+    // Logout should still complete when storage is unavailable.
+  }
+  window.dispatchEvent(new CustomEvent(FOLLOW_UP_EVENT, { detail: participantCode }));
+}
+
 function isChatMessage(value: unknown): value is ChatMessage {
   if (!value || typeof value !== "object") return false;
   const message = value as Record<string, unknown>;

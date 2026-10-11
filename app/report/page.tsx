@@ -1,9 +1,18 @@
 "use client";
 
 import { startTransition, useEffect, useRef, useState } from "react";
-import { mockReports } from "@/lib/mock";
+import { useRouter } from "next/navigation";
+import {
+  ApiError,
+  analyzeReport,
+  getBrowserSession,
+  logoutBrowserSession,
+  prepareReport,
+  submitReport,
+} from "@/lib/frontend-api";
 import {
   appendChatMessage,
+  clearParticipantChatData,
   dailyChatKey,
   readFollowUpState,
   readChatMessages,
@@ -15,11 +24,21 @@ import {
   type FollowUpState,
 } from "@/lib/chat";
 import { MicHero } from "@/components/ui/MicHero";
+import {
+  ParticipantReportReview,
+  type EditablePreparedSymptom,
+} from "@/components/ui/ParticipantReportReview";
 import { SideTabs, type Tab } from "@/components/ui/SideTabs";
 import type { Language } from "@/lib/types";
+import type {
+  AnalyzeResponse,
+  PrepareReportResponse,
+  SubmitReportRequest,
+  SubmitReportResponse,
+} from "@/types/reports";
 
 type Onboard = "language" | "done";
-type Flow = "idle" | "readback" | "done";
+type Flow = "idle" | "review" | "done";
 
 // Fictional placeholder for the demo
 const STUDY_TEAM_PHONE = "[study team number]";
@@ -36,20 +55,6 @@ const langOptions: { code: Language; label: string }[] = [
   { code: "zh", label: "中文（普通话）" },
   { code: "vi", label: "Tiếng Việt" },
 ];
-
-const dateLocale: Record<Language, string> = {
-  en: "en-US",
-  es: "es-US",
-  zh: "zh-CN",
-  vi: "vi-VN",
-};
-
-const sampleStory: Record<Language, string> = {
-  en: "My stomach hurts and I feel dizzy since Tuesday.",
-  es: "Me duele el estómago y me siento mareada desde el martes.",
-  zh: "我从星期二开始肚子疼，还觉得头晕。",
-  vi: "Tôi bị đau bụng và thấy chóng mặt từ thứ Ba.",
-};
 
 const copy: Record<Language, {
   tabs: Record<Tab, string>;
@@ -87,6 +92,44 @@ const copy: Record<Language, {
   followUpReminder: string;
   appointmentScheduled: string;
   willScheduleLater: string;
+  reviewTitle: string;
+  translatedReport: string;
+  summary: string;
+  extractedSymptoms: string;
+  symptom: string;
+  selectSymptom: string;
+  participantDescription: string;
+  descriptionError: string;
+  reportedIntensity: string;
+  intensityHint: string;
+  intensityError: string;
+  onsetDate: string;
+  onsetText: string;
+  ongoing: string;
+  ongoingCandidate: string;
+  unknown: string;
+  ongoingYes: string;
+  ongoingNo: string;
+  noSymptoms: string;
+  verified: string;
+  unverified: string;
+  manualReview: string;
+  analysisClarification: string;
+  reviewConfirmation: string;
+  submitReport: string;
+  submittingReport: string;
+  cancelReview: string;
+  authLink: string;
+  voiceUnavailable: string;
+  analyzing: string;
+  preparing: string;
+  historyNotConnected: string;
+  reportId: string;
+  signOut: string;
+  signingOut: string;
+  checkingSession: string;
+  sessionRequired: string;
+  sessionExpired: string;
 }> = {
   en: {
     tabs: { home: "Home", profile: "Profile", past: "Past reports" },
@@ -100,7 +143,7 @@ const copy: Record<Language, {
     isRight: "Is that right?",
     yes: "Yes, that's right",
     change: "No, let me change it",
-    saved: "Your report was saved for your study team to review.",
+    saved: "Your report was submitted to your study team for review.",
     safetyTitle: "If you feel very unwell",
     safety: `Please call your study team at ${STUDY_TEAM_PHONE} now. If it's an emergency, call 911.`,
     noDiagnose: "This app does not diagnose. It only records what you tell it.",
@@ -124,6 +167,44 @@ const copy: Record<Language, {
     followUpReminder: "Reminder: Please contact your doctor to schedule a follow-up about your report. If it is an emergency, call 911.",
     appointmentScheduled: "Appointment Scheduled",
     willScheduleLater: "Understood, Will Schedule Later",
+    reviewTitle: "Review your report",
+    translatedReport: "English translation",
+    summary: "Analysis summary",
+    extractedSymptoms: "Extracted symptoms",
+    symptom: "Symptom",
+    selectSymptom: "Select a symptom from the study catalog",
+    participantDescription: "Description in your words",
+    descriptionError: "Please keep the description to 2,000 characters or fewer.",
+    reportedIntensity: "Intensity you reported (0–10)",
+    intensityHint: "Leave blank if you did not say a number.",
+    intensityError: "Intensity must be a whole number from 0 to 10.",
+    onsetDate: "Start date (optional)",
+    onsetText: "Analysis timing",
+    ongoing: "Is this still happening?",
+    ongoingCandidate: "Analysis suggestion",
+    unknown: "Not sure / not reported",
+    ongoingYes: "Yes",
+    ongoingNo: "No",
+    noSymptoms: "No symptoms were extracted. Do not add any that you did not report.",
+    verified: "This detail appears in your original report.",
+    unverified: "Please check this detail against your original report.",
+    manualReview: "Please check each symptom and its original wording carefully.",
+    analysisClarification: "Analysis suggested question (review only)",
+    reviewConfirmation: "I reviewed this report and confirm it accurately reflects what I reported.",
+    submitReport: "Confirm and submit report",
+    submittingReport: "Submitting…",
+    cancelReview: "Edit my report",
+    authLink: "Open participant sign-in",
+    voiceUnavailable: "Voice transcription is not connected yet. You can type your report instead.",
+    analyzing: "Analyzing your report…",
+    preparing: "Preparing symptom details…",
+    historyNotConnected: "Past report history is not available from the current participant API.",
+    reportId: "Report reference",
+    signOut: "Sign out",
+    signingOut: "Signing out…",
+    checkingSession: "Checking session…",
+    sessionRequired: "Sign in with a participant account to continue.",
+    sessionExpired: "Your session has expired. Sign in again to continue.",
   },
   es: {
     tabs: { home: "Inicio", profile: "Perfil", past: "Reportes anteriores" },
@@ -137,7 +218,7 @@ const copy: Record<Language, {
     isRight: "¿Es correcto?",
     yes: "Sí, es correcto",
     change: "No, quiero cambiarlo",
-    saved: "Tu reporte se guardó para que tu equipo del estudio lo revise.",
+    saved: "Tu reporte se envió a tu equipo del estudio para que lo revise.",
     safetyTitle: "Si te sientes muy mal",
     safety: `Llama a tu equipo del estudio al ${STUDY_TEAM_PHONE} ahora. Si es una emergencia, llama al 911.`,
     noDiagnose: "Esta app no diagnostica. Solo registra lo que tú le dices.",
@@ -161,6 +242,44 @@ const copy: Record<Language, {
     followUpReminder: "Recordatorio: Comunícate con tu médico para programar una cita de seguimiento sobre tu reporte. Si es una emergencia, llama al 911.",
     appointmentScheduled: "Cita programada",
     willScheduleLater: "Entendido, programaré la cita más adelante",
+    reviewTitle: "Revisa tu reporte",
+    translatedReport: "Traducción al inglés",
+    summary: "Resumen del análisis",
+    extractedSymptoms: "Síntomas extraídos",
+    symptom: "Síntoma",
+    selectSymptom: "Selecciona un síntoma del catálogo del estudio",
+    participantDescription: "Descripción con tus palabras",
+    descriptionError: "La descripción debe tener 2.000 caracteres o menos.",
+    reportedIntensity: "Intensidad que reportaste (0–10)",
+    intensityHint: "Déjalo en blanco si no dijiste un número.",
+    intensityError: "La intensidad debe ser un número entero del 0 al 10.",
+    onsetDate: "Fecha de inicio (opcional)",
+    onsetText: "Tiempo según el análisis",
+    ongoing: "¿Sigue ocurriendo?",
+    ongoingCandidate: "Sugerencia del análisis",
+    unknown: "No sé / no lo reporté",
+    ongoingYes: "Sí",
+    ongoingNo: "No",
+    noSymptoms: "No se extrajeron síntomas. No agregues ninguno que no hayas reportado.",
+    verified: "Este detalle aparece en tu reporte original.",
+    unverified: "Revisa este detalle con respecto a tu reporte original.",
+    manualReview: "Revisa cuidadosamente cada síntoma y su redacción original.",
+    analysisClarification: "Pregunta sugerida por el análisis (solo para revisar)",
+    reviewConfirmation: "Revisé este reporte y confirmo que refleja con precisión lo que reporté.",
+    submitReport: "Confirmar y enviar reporte",
+    submittingReport: "Enviando…",
+    cancelReview: "Editar mi reporte",
+    authLink: "Abrir inicio de sesión del participante",
+    voiceUnavailable: "La transcripción de voz aún no está conectada. Puedes escribir tu reporte.",
+    analyzing: "Analizando tu reporte…",
+    preparing: "Preparando los síntomas…",
+    historyNotConnected: "El API actual para participantes no permite consultar reportes anteriores.",
+    reportId: "Referencia del reporte",
+    signOut: "Cerrar sesión",
+    signingOut: "Cerrando sesión…",
+    checkingSession: "Verificando sesión…",
+    sessionRequired: "Inicia sesión con una cuenta de participante para continuar.",
+    sessionExpired: "Tu sesión venció. Inicia sesión otra vez para continuar.",
   },
   zh: {
     tabs: { home: "首页", profile: "我的资料", past: "以往报告" },
@@ -174,7 +293,7 @@ const copy: Record<Language, {
     isRight: "对吗？",
     yes: "对，没错",
     change: "不对，我要修改",
-    saved: "您的报告已保存，供您的研究团队查看。",
+    saved: "您的报告已提交，供研究团队查看。",
     safetyTitle: "如果您感觉非常不舒服",
     safety: `请立即致电您的研究团队 ${STUDY_TEAM_PHONE}。如果情况紧急，请拨打911。`,
     noDiagnose: "本应用不做诊断，只记录您所说的内容。",
@@ -198,6 +317,44 @@ const copy: Record<Language, {
     followUpReminder: "提醒：请联系您的医生，预约讨论您的报告。如果是紧急情况，请拨打911。",
     appointmentScheduled: "已预约",
     willScheduleLater: "明白，我稍后预约",
+    reviewTitle: "请检查您的报告",
+    translatedReport: "英文翻译",
+    summary: "分析摘要",
+    extractedSymptoms: "提取的症状",
+    symptom: "症状",
+    selectSymptom: "请从研究目录中选择症状",
+    participantDescription: "用您的话描述",
+    descriptionError: "描述不能超过2,000个字符。",
+    reportedIntensity: "您报告的程度（0–10）",
+    intensityHint: "如果您没有说数字，请留空。",
+    intensityError: "程度必须是0到10之间的整数。",
+    onsetDate: "开始日期（可选）",
+    onsetText: "分析中的时间描述",
+    ongoing: "这种情况仍在发生吗？",
+    ongoingCandidate: "分析建议",
+    unknown: "不确定 / 未报告",
+    ongoingYes: "是",
+    ongoingNo: "否",
+    noSymptoms: "未提取到症状。请勿添加您没有报告的症状。",
+    verified: "此内容出现在您的原始报告中。",
+    unverified: "请根据您的原始报告核对此内容。",
+    manualReview: "请仔细核对每项症状及其原始描述。",
+    analysisClarification: "分析建议的问题（仅供查看）",
+    reviewConfirmation: "我已检查此报告，并确认其准确反映了我的陈述。",
+    submitReport: "确认并提交报告",
+    submittingReport: "正在提交…",
+    cancelReview: "修改我的报告",
+    authLink: "打开参与者登录页面",
+    voiceUnavailable: "语音转写尚未连接。您可以改为输入报告。",
+    analyzing: "正在分析您的报告…",
+    preparing: "正在整理症状…",
+    historyNotConnected: "当前参与者 API 暂不支持查看以往报告。",
+    reportId: "报告编号",
+    signOut: "退出登录",
+    signingOut: "正在退出…",
+    checkingSession: "正在检查登录状态…",
+    sessionRequired: "请使用参与者账户登录后继续。",
+    sessionExpired: "登录已过期。请重新登录后继续。",
   },
   vi: {
     tabs: { home: "Trang chủ", profile: "Hồ sơ", past: "Báo cáo cũ" },
@@ -211,7 +368,7 @@ const copy: Record<Language, {
     isRight: "Có đúng không?",
     yes: "Đúng rồi",
     change: "Không, tôi muốn sửa",
-    saved: "Báo cáo của bạn đã được lưu để nhóm nghiên cứu xem xét.",
+    saved: "Báo cáo của bạn đã được gửi để nhóm nghiên cứu xem xét.",
     safetyTitle: "Nếu bạn cảm thấy rất không khỏe",
     safety: `Hãy gọi ngay cho nhóm nghiên cứu theo số ${STUDY_TEAM_PHONE}. Nếu khẩn cấp, hãy gọi 911.`,
     noDiagnose: "Ứng dụng này không chẩn đoán bệnh. Nó chỉ ghi lại những gì bạn nói.",
@@ -235,6 +392,44 @@ const copy: Record<Language, {
     followUpReminder: "Nhắc nhở: Vui lòng liên hệ bác sĩ để đặt lịch trao đổi về báo cáo. Nếu khẩn cấp, hãy gọi 911.",
     appointmentScheduled: "Đã đặt lịch hẹn",
     willScheduleLater: "Đã hiểu, tôi sẽ đặt lịch sau",
+    reviewTitle: "Xem lại báo cáo của bạn",
+    translatedReport: "Bản dịch tiếng Anh",
+    summary: "Tóm tắt phân tích",
+    extractedSymptoms: "Triệu chứng được trích xuất",
+    symptom: "Triệu chứng",
+    selectSymptom: "Chọn triệu chứng từ danh mục nghiên cứu",
+    participantDescription: "Mô tả theo lời của bạn",
+    descriptionError: "Mô tả không được vượt quá 2.000 ký tự.",
+    reportedIntensity: "Mức độ bạn đã báo cáo (0–10)",
+    intensityHint: "Để trống nếu bạn không nêu con số.",
+    intensityError: "Mức độ phải là số nguyên từ 0 đến 10.",
+    onsetDate: "Ngày bắt đầu (không bắt buộc)",
+    onsetText: "Thời điểm trong phân tích",
+    ongoing: "Triệu chứng này còn tiếp diễn không?",
+    ongoingCandidate: "Gợi ý từ phân tích",
+    unknown: "Không chắc / chưa báo cáo",
+    ongoingYes: "Có",
+    ongoingNo: "Không",
+    noSymptoms: "Không trích xuất được triệu chứng nào. Đừng thêm triệu chứng bạn chưa báo cáo.",
+    verified: "Chi tiết này có trong báo cáo ban đầu của bạn.",
+    unverified: "Hãy kiểm tra chi tiết này với báo cáo ban đầu.",
+    manualReview: "Hãy kiểm tra kỹ từng triệu chứng và mô tả ban đầu.",
+    analysisClarification: "Câu hỏi gợi ý từ phân tích (chỉ để xem xét)",
+    reviewConfirmation: "Tôi đã xem lại và xác nhận báo cáo phản ánh chính xác những gì tôi đã nói.",
+    submitReport: "Xác nhận và gửi báo cáo",
+    submittingReport: "Đang gửi…",
+    cancelReview: "Sửa báo cáo của tôi",
+    authLink: "Mở trang đăng nhập người tham gia",
+    voiceUnavailable: "Chưa kết nối tính năng chuyển giọng nói thành văn bản. Bạn có thể nhập báo cáo.",
+    analyzing: "Đang phân tích báo cáo…",
+    preparing: "Đang chuẩn bị thông tin triệu chứng…",
+    historyNotConnected: "API dành cho người tham gia hiện chưa hỗ trợ xem báo cáo cũ.",
+    reportId: "Mã tham chiếu báo cáo",
+    signOut: "Đăng xuất",
+    signingOut: "Đang đăng xuất…",
+    checkingSession: "Đang kiểm tra phiên đăng nhập…",
+    sessionRequired: "Vui lòng đăng nhập bằng tài khoản người tham gia để tiếp tục.",
+    sessionExpired: "Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại để tiếp tục.",
   },
 };
 
@@ -246,8 +441,6 @@ const primaryBtn = `${big} bg-forest-800 text-white hover:bg-leaf hover:ring-2 h
 const secondaryBtn = `${big} border border-forest-800/30 bg-white/70 text-forest-800 hover:bg-white hover:ring-2 hover:ring-glow/60`;
 const field =
   "w-full border border-forest-800/25 bg-white/90 text-lg transition-all duration-300 ease-out hover:ring-2 hover:ring-glow/60";
-const card = "rounded-2xl border border-forest-800/20 bg-white/80 p-4";
-
 function Header() {
   return (
     <header className="flex items-center gap-3 bg-forest-950 px-6 py-2 text-white">
@@ -261,7 +454,9 @@ function Header() {
 }
 
 export default function ReportPage() {
+  const router = useRouter();
   const [onboard, setOnboard] = useState<Onboard>("language");
+  const [sessionReady, setSessionReady] = useState(false);
   const [tab, setTab] = useState<Tab>("home");
   const [flow, setFlow] = useState<Flow>("idle");
   const [lang, setLang] = useState<Language>("es");
@@ -272,9 +467,43 @@ export default function ReportPage() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatKey, setChatKey] = useState("");
   const [followUpState, setFollowUpState] = useState<FollowUpState>(noFollowUp);
+  const [reportSource, setReportSource] = useState<"portal" | "voice">("portal");
+  const [reportActivity, setReportActivity] = useState<"idle" | "analyzing" | "preparing" | "submitting">("idle");
+  const [reportError, setReportError] = useState<string | null>(null);
+  const [authenticationBlocked, setAuthenticationBlocked] = useState(false);
+  const [analysis, setAnalysis] = useState<AnalyzeResponse | null>(null);
+  const [prepared, setPrepared] = useState<PrepareReportResponse | null>(null);
+  const [reviewSymptoms, setReviewSymptoms] = useState<EditablePreparedSymptom[]>([]);
+  const [englishSummary, setEnglishSummary] = useState("");
+  const [reviewConfirmed, setReviewConfirmed] = useState(false);
+  const [submissionUncertain, setSubmissionUncertain] = useState(false);
+  const [submittedReport, setSubmittedReport] = useState<SubmitReportResponse["report"] | null>(null);
+  const [sessionChecking, setSessionChecking] = useState(false);
+  const [logoutBusy, setLogoutBusy] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   const L = copy[lang];
+
+  useEffect(() => {
+    const controller = new AbortController();
+    getBrowserSession(controller.signal)
+      .then((session) => {
+        if (controller.signal.aborted) return;
+        if (!session.authenticated) {
+          router.replace("/participant-login");
+          return;
+        }
+        if (session.user.role !== "participant") {
+          router.replace("/dashboard");
+          return;
+        }
+        setSessionReady(true);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) router.replace("/participant-login");
+      });
+    return () => controller.abort();
+  }, [router]);
 
   useEffect(() => {
     const syncMessages = (next: ChatMessage[]) => {
@@ -354,20 +583,145 @@ export default function ReportPage() {
     );
 
   function toggleMic() {
-    if (listening) {
-      setListening(false);
-      // Demo placeholder: replace with the transcript from POST /api/transcribe.
-      setStory(sampleStory[lang]);
-      setFlow("readback");
-    } else {
-      setListening(true);
-    }
+    setListening(false);
+    setReportError(L.voiceUnavailable);
+    setAuthenticationBlocked(false);
   }
 
   function reset() {
     setFlow("idle");
     setStory("");
     setTyping(false);
+    setAnalysis(null);
+    setPrepared(null);
+    setReviewSymptoms([]);
+    setEnglishSummary("");
+    setReviewConfirmed(false);
+    setReportError(null);
+    setAuthenticationBlocked(false);
+    setSubmissionUncertain(false);
+    setSubmittedReport(null);
+  }
+
+  function showRequestError(error: unknown) {
+    if (error instanceof ApiError) {
+      const sessionInvalid = error.status === 401 || error.code === "FORBIDDEN";
+      setReportError(
+        error.status === 401
+          ? L.sessionExpired
+          : error.status === 403 && error.code === "FORBIDDEN"
+            ? L.sessionRequired
+            : error.message,
+      );
+      setAuthenticationBlocked(
+        error.status === 401 ||
+          error.code === "FORBIDDEN" ||
+          error.code === "BROWSER_AUTH_UNAVAILABLE" ||
+          error.code === "DEMO_AUTH_UNAVAILABLE" ||
+          error.message === "Authentication unavailable",
+      );
+      if (sessionInvalid) {
+        setFlow("idle");
+        setStory("");
+        setAnalysis(null);
+        setPrepared(null);
+        setReviewSymptoms([]);
+        setEnglishSummary("");
+        setReviewConfirmed(false);
+        setSubmittedReport(null);
+        setChatMessages([]);
+        setChatOpen(false);
+        setChatKey("");
+        clearParticipantChatData(DEMO_PARTICIPANT_CODE);
+        router.replace("/participant-login?session=expired");
+        router.refresh();
+      }
+      return;
+    }
+    setReportError("Something went wrong. Please try again.");
+    setAuthenticationBlocked(false);
+  }
+
+  async function prepareParticipantReport(transcript: string, source: "portal" | "voice") {
+    if (!transcript.trim() || reportActivity !== "idle") return;
+    setReportError(null);
+    setAuthenticationBlocked(false);
+    setSubmissionUncertain(false);
+    setReviewConfirmed(false);
+    setReportSource(source);
+    setReportActivity("analyzing");
+    try {
+      const result = await analyzeReport({ transcript, language: lang });
+      setAnalysis(result);
+      setReportActivity("preparing");
+      const preparedReport = await prepareReport({ source, transcript, analysis: result });
+      setPrepared(preparedReport);
+      setEnglishSummary(preparedReport.draft.englishSummary ?? "");
+      setReviewSymptoms(preparedReport.draft.symptoms.map((symptom) => ({
+        ...symptom,
+        symptomCode: symptom.suggestedSymptomCode ?? "",
+        reportedIntensity: null,
+        onsetDate: "",
+        ongoing: null,
+        participantDescription: symptom.sourceExcerpt,
+      })));
+      setFlow("review");
+    } catch (error) {
+      showRequestError(error);
+    } finally {
+      setReportActivity("idle");
+    }
+  }
+
+  async function submitPreparedReport() {
+    if (!prepared || !analysis || !reviewConfirmed || submissionUncertain || reportActivity !== "idle") {
+      return;
+    }
+    if (reviewSymptoms.some((symptom) => !symptom.symptomCode)) {
+      setReportError(L.selectSymptom);
+      return;
+    }
+    if (new Set(reviewSymptoms.map((symptom) => symptom.symptomCode)).size !== reviewSymptoms.length) {
+      setReportError("Each symptom must have a different catalog entry.");
+      return;
+    }
+
+    const request: SubmitReportRequest = {
+      workflowStatus: "submitted",
+      confirmed: true,
+      source: reportSource,
+      originalLanguage: prepared.draft.originalLanguage,
+      originalTranscript: prepared.draft.originalTranscript,
+      englishSummary: englishSummary.trim() || null,
+      symptoms: reviewSymptoms.map((symptom) => ({
+        symptomCode: symptom.symptomCode,
+        reportedIntensity: symptom.reportedIntensity,
+        onsetDate: symptom.onsetDate || null,
+        ongoing: symptom.ongoing,
+        participantDescription: symptom.participantDescription.trim() || null,
+      })),
+    };
+
+    setReportError(null);
+    setAuthenticationBlocked(false);
+    setReportActivity("submitting");
+    try {
+      const result = await submitReport(request);
+      setSubmittedReport(result.report);
+      setFlow("done");
+    } catch (error) {
+      showRequestError(error);
+      if (
+        error instanceof ApiError &&
+        (error.status === 0 ||
+          error.status === 500 ||
+          (error.status === 503 && error.code !== "DEMO_AUTH_UNAVAILABLE"))
+      ) {
+        setSubmissionUncertain(true);
+      }
+    } finally {
+      setReportActivity("idle");
+    }
   }
 
   function respondToFollowUp(kind: "appointment_scheduled" | "will_schedule_later") {
@@ -409,17 +763,63 @@ export default function ReportPage() {
     }
   }
 
-  function enterApp() {
+  async function enterApp() {
+    setSessionChecking(true);
+    setReportError(null);
+    setAuthenticationBlocked(false);
+    try {
+      const session = await getBrowserSession();
+      if (!session.authenticated || session.user.role !== "participant") {
+        setReportError(L.sessionRequired);
+        setAuthenticationBlocked(true);
+        return;
+      }
+    } catch (error) {
+      showRequestError(error);
+      return;
+    } finally {
+      setSessionChecking(false);
+    }
     const today = new Date().toLocaleDateString("en-CA");
     setChatKey(dailyChatKey(DEMO_PARTICIPANT_CODE, today));
     setOnboard("done");
   }
 
-  // Keep the patient demo scoped to its existing mock participant.
-  const past = mockReports.filter((r) => r.participantCode === DEMO_PARTICIPANT_CODE);
+  async function signOut() {
+    if (logoutBusy) return;
+    setLogoutBusy(true);
+    setReportError(null);
+    try {
+      await logoutBrowserSession();
+      clearParticipantChatData(DEMO_PARTICIPANT_CODE);
+      setChatMessages([]);
+      setChatKey("");
+      setChatOpen(false);
+      reset();
+      router.replace("/participant-login");
+      router.refresh();
+    } catch (error) {
+      showRequestError(error);
+    } finally {
+      setLogoutBusy(false);
+    }
+  }
 
   const page =
     "flex min-h-screen flex-col bg-[#c3dccd] bg-gradient-to-br from-[#d8e8dd] via-[#c3dccd] to-[#a8cdbb] text-ink";
+
+  if (!sessionReady) {
+    return (
+      <div className={page}>
+        <Header />
+        <main className="flex flex-1 items-center justify-center p-4">
+          <p role="status" className={`rounded-2xl p-5 text-center text-forest-800 ${glass}`}>
+            Checking your session…
+          </p>
+        </main>
+      </div>
+    );
+  }
 
   // ---------- First open: choose a language ----------
   if (onboard !== "done") {
@@ -460,9 +860,15 @@ export default function ReportPage() {
                     </svg>
                   </span>
                 </label>
-                <button className={primaryBtn} onClick={enterApp}>
-                  {L.next}
+                <button className={primaryBtn} disabled={sessionChecking} onClick={() => void enterApp()}>
+                  {sessionChecking ? L.checkingSession : L.next}
                 </button>
+                {reportError && (
+                  <div role="alert" className="rounded-2xl border border-red-800/20 bg-red-50 p-3 text-sm text-red-900">
+                    <p>{reportError}</p>
+                    {authenticationBlocked && <a href="/participant-login" className="mt-2 inline-block font-semibold underline">{L.authLink}</a>}
+                  </div>
+                )}
               </section>
             )}
           </main>
@@ -498,47 +904,101 @@ export default function ReportPage() {
                 <div className="flex w-full flex-col gap-3">
                   <textarea
                     value={story}
-                    onChange={(e) => setStory(e.target.value)}
+                    onChange={(event) => {
+                      setStory(event.target.value);
+                      setReportError(null);
+                      setAuthenticationBlocked(false);
+                    }}
                     placeholder={L.typePlaceholder}
                     rows={4}
                     className={`${field} rounded-2xl p-4`}
                   />
                   <button
                     className={primaryBtn}
-                    disabled={!story.trim()}
-                    onClick={() => {
-                      setFlow("readback");
-                    }}
+                    disabled={!story.trim() || reportActivity !== "idle"}
+                    onClick={() => void prepareParticipantReport(story, "portal")}
                   >
-                    {L.next}
+                    {reportActivity === "analyzing"
+                      ? L.analyzing
+                      : reportActivity === "preparing"
+                        ? L.preparing
+                        : L.next}
                   </button>
+                </div>
+              )}
+              {reportActivity !== "idle" && (
+                <p role="status" aria-live="polite" className="text-center text-sm text-forest-800">
+                  {reportActivity === "analyzing" ? L.analyzing : L.preparing}
+                </p>
+              )}
+              {reportError && (
+                <div role="alert" className="w-full rounded-2xl border border-red-800/20 bg-red-50 p-3 text-sm text-red-900">
+                  <p>{reportError}</p>
+                  {authenticationBlocked && (
+                    <a href="/participant-login" className="mt-2 inline-block font-semibold underline">
+                      {L.authLink}
+                    </a>
+                  )}
                 </div>
               )}
             </section>
           )}
 
-          {tab === "home" && flow === "readback" && (
-            <section className="flex flex-col gap-4">
-              {/* Placeholder: replace with Muna's POST /api/analyze summary in the patient's language */}
-              <h1 className="text-3xl font-bold text-forest-800">{L.heard}</h1>
-              <div className={`${card} flex flex-col gap-2 text-lg`}>
-                <p>&ldquo;{story}&rdquo;</p>
-              </div>
-              <p className="text-xl font-medium text-forest-800">{L.isRight}</p>
-              {/* Placeholder: call POST /api/reports here before showing the done screen */}
-              <button className={primaryBtn} onClick={() => setFlow("done")}>
-                {L.yes}
-              </button>
-              <button
-                className={secondaryBtn}
-                onClick={() => {
-                  setFlow("idle");
-                  setTyping(false);
-                }}
-              >
-                {L.change}
-              </button>
-            </section>
+          {tab === "home" && flow === "review" && analysis && prepared && (
+            <ParticipantReportReview
+              transcript={prepared.draft.originalTranscript}
+              analysis={analysis}
+              draft={prepared.draft}
+              symptomCatalog={prepared.symptomCatalog}
+              symptoms={reviewSymptoms}
+              onSymptomsChange={setReviewSymptoms}
+              englishSummary={englishSummary}
+              onEnglishSummaryChange={setEnglishSummary}
+              confirmed={reviewConfirmed}
+              onConfirmedChange={setReviewConfirmed}
+              onSubmit={() => void submitPreparedReport()}
+              onCancel={() => {
+                setFlow("idle");
+                setTyping(true);
+                setReportError(null);
+                setReviewConfirmed(false);
+              }}
+              labels={{
+                title: L.reviewTitle,
+                originalTranscript: L.heard,
+                translatedReport: L.translatedReport,
+                summary: L.summary,
+                extractedSymptoms: L.extractedSymptoms,
+                symptom: L.symptom,
+                selectSymptom: L.selectSymptom,
+                participantDescription: L.participantDescription,
+                descriptionError: L.descriptionError,
+                reportedIntensity: L.reportedIntensity,
+                intensityHint: L.intensityHint,
+                intensityError: L.intensityError,
+                onsetDate: L.onsetDate,
+                onsetText: L.onsetText,
+                ongoing: L.ongoing,
+                ongoingCandidate: L.ongoingCandidate,
+                unknown: L.unknown,
+                ongoingYes: L.ongoingYes,
+                ongoingNo: L.ongoingNo,
+                noSymptoms: L.noSymptoms,
+                verified: L.verified,
+                unverified: L.unverified,
+                manualReview: L.manualReview,
+                analysisClarification: L.analysisClarification,
+                reviewConfirmation: L.reviewConfirmation,
+                submit: L.submitReport,
+                submitting: L.submittingReport,
+                cancel: L.cancelReview,
+                authLink: L.authLink,
+              }}
+              isSubmitting={reportActivity === "submitting"}
+              error={reportError}
+              authenticationBlocked={authenticationBlocked}
+              submissionUncertain={submissionUncertain}
+            />
           )}
 
           {tab === "home" && flow === "done" && (
@@ -550,6 +1010,11 @@ export default function ReportPage() {
                 <h2 className="text-xl font-bold text-forest-800">{L.safetyTitle}</h2>
                 <p className="text-lg">{L.safety}</p>
               </div>
+              {submittedReport && (
+                <p className="rounded-2xl border border-forest-800/15 bg-white/70 p-3 text-sm text-muted">
+                  {L.reportId}: {submittedReport.id}
+                </p>
+              )}
               <p className="text-muted">{L.noDiagnose}</p>
               <button className={primaryBtn} onClick={reset}>
                 {L.again}
@@ -580,36 +1045,22 @@ export default function ReportPage() {
                   ))}
                 </div>
               </fieldset>
+              {reportError && <p role="alert" className="text-sm text-red-900">{reportError}</p>}
+              <button
+                type="button"
+                onClick={() => void signOut()}
+                disabled={logoutBusy}
+                className={secondaryBtn}
+              >
+                {logoutBusy ? L.signingOut : L.signOut}
+              </button>
             </section>
           )}
 
           {tab === "past" && (
             <section className="flex flex-col gap-4">
               <h1 className="text-3xl font-bold text-forest-800">{L.pastTitle}</h1>
-              {past.length === 0 ? (
-                <p className="text-lg text-muted">{L.pastEmpty}</p>
-              ) : (
-                <ul className="flex flex-col gap-3">
-                  {past.map((r) => (
-                    <li
-                      key={r.id}
-                      className={`${card} border-l-8 border-l-green-600 transition-all duration-300 ease-out hover:-translate-y-0.5 hover:shadow-lg hover:ring-2 hover:ring-glow/70`}
-                    >
-                      <div className="flex items-center justify-between gap-2 text-sm text-muted">
-                        <span>
-                          {new Date(r.createdAt).toLocaleDateString(dateLocale[lang], {
-                            dateStyle: "medium",
-                          })}
-                        </span>
-                        <span className="inline-flex h-7 min-w-24 items-center justify-center whitespace-nowrap rounded-full bg-green-100 px-3 text-sm font-medium text-green-900">
-                          {L.savedTag}
-                        </span>
-                      </div>
-                      <p className="mt-2 text-lg">&ldquo;{r.transcript}&rdquo;</p>
-                    </li>
-                  ))}
-                </ul>
-              )}
+              <p className="text-lg text-muted">{L.historyNotConnected}</p>
             </section>
           )}
 

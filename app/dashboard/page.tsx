@@ -1,21 +1,24 @@
 "use client";
 
 import { startTransition, useEffect, useMemo, useState } from "react";
-import { mockReports } from "@/lib/mock";
+import { useRouter } from "next/navigation";
 import {
-  appendChatMessage,
+  ApiError,
+  getBrowserSession,
+  getCoordinatorReports,
+  logoutBrowserSession,
+} from "@/lib/frontend-api";
+import {
   dailyChatKey,
-  readFollowUpState,
   readChatMessages,
   subscribeToChatMessages,
   type ChatMessage,
-  writeFollowUpState,
 } from "@/lib/chat";
 import { StatusBadge } from "@/components/ui/StatusBadge";
-import type { Report, ReviewStatus } from "@/lib/types";
+import type { CoordinatorReport, CoordinatorWorkflowStatus } from "@/types/reports";
 
 type Section = "reports" | "participants" | "trial";
-type StatusF = "all" | ReviewStatus;
+type StatusF = "all" | CoordinatorWorkflowStatus;
 type IntensityF = "all" | "high" | "medium" | "low";
 
 const langName = {
@@ -27,22 +30,17 @@ const langName = {
 // Fictional placeholders (not saved anywhere yet)
 const coordinators = ["Unassigned", "Coordinator A", "Coordinator B"];
 
-const autoMessages: Partial<Record<ReviewStatus, string>> = {
-  reviewed:
-    "Your doctor has reviewed your symptom report. Thank you for sharing how you are feeling.",
-  follow_up_requested: `Your doctor would like to follow up with you about your report. Please contact your doctor to schedule an appointment. If it is an emergency, call 911.`,
-};
-
 const sections: { id: Section; label: string }[] = [
   { id: "reports", label: "Symptom reports" },
   { id: "participants", label: "Participants" },
   { id: "trial", label: "Trial overview" },
 ];
 
-const borderByStatus: Record<ReviewStatus, string> = {
-  new: "border-l-blue-500",
+const borderByStatus: Record<CoordinatorWorkflowStatus, string> = {
+  submitted: "border-l-blue-500",
   reviewed: "border-l-green-600",
   follow_up_requested: "border-l-amber-500",
+  closed: "border-l-slate-500",
 };
 
 // Hover = a rounded button shape with a soft amber glow
@@ -63,11 +61,14 @@ function fmtDate(iso: string) {
 function fmtTime(iso: string) {
   return new Date(iso).toLocaleTimeString("en-US", { timeStyle: "short" });
 }
+function formatLanguage(language: string) {
+  return langName[language as keyof typeof langName] ?? language;
+}
 
 // Highest intensity the participant reported (no AI judgment)
-function maxIntensity(r: Report): number | null {
-  const nums = r.analysis.symptoms
-    .map((s) => s.intensity)
+function maxIntensity(r: CoordinatorReport): number | null {
+  const nums = r.symptoms
+    .map((s) => s.reportedIntensity)
     .filter((n): n is number => n !== null);
   return nums.length ? Math.max(...nums) : null;
 }
@@ -114,39 +115,157 @@ function FilterGroup<T extends string>({
 }
 
 export default function DashboardPage() {
-  // Placeholder: replace with GET /api/reports
-  const [reports, setReports] = useState<Report[]>(mockReports);
+  const router = useRouter();
+  const [reports, setReports] = useState<CoordinatorReport[]>([]);
   const [section, setSection] = useState<Section>("reports");
-  const [selectedId, setSelectedId] = useState(reports[0].id);
+  const [selectedId, setSelectedId] = useState("");
   const [statusF, setStatusF] = useState<StatusF>("all");
   const [intensityF, setIntensityF] = useState<IntensityF>("all");
   const [query, setQuery] = useState("");
   const [assignee, setAssignee] = useState<Record<string, string>>({});
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [today, setToday] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [authenticationBlocked, setAuthenticationBlocked] = useState(false);
+  const [nextOffset, setNextOffset] = useState<number | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [logoutBusy, setLogoutBusy] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const session = await getBrowserSession(controller.signal);
+        if (!session.authenticated) {
+          router.replace("/coordinator-login");
+          return;
+        }
+        if (session.user.role !== "coordinator") {
+          router.replace("/report");
+          return;
+        }
+        const response = await getCoordinatorReports({ limit: 20, offset: 0 }, controller.signal);
+        startTransition(() => {
+          setReports(response.reports);
+          setNextOffset(response.pagination.nextOffset);
+          setSelectedId((current) =>
+            response.reports.some((report) => report.id === current)
+              ? current
+              : response.reports[0]?.id ?? "",
+          );
+          setLoadError(null);
+          setAuthenticationBlocked(false);
+          setLoading(false);
+        });
+      } catch (error: unknown) {
+        if (controller.signal.aborted) return;
+        if (error instanceof ApiError && error.status === 401) {
+          startTransition(() => {
+            setReports([]);
+            setSelectedId("");
+            setMessages([]);
+            router.replace("/coordinator-login?session=expired");
+          });
+          return;
+        }
+        const blocked = error instanceof ApiError && (
+          error.status === 401 ||
+          error.status === 403 ||
+          error.code === "BROWSER_AUTH_UNAVAILABLE" ||
+          error.code === "COORDINATOR_AUTH_UNAVAILABLE"
+        );
+        startTransition(() => {
+          setLoadError(error instanceof Error ? error.message : "Reports could not be loaded.");
+          setAuthenticationBlocked(blocked);
+          if (blocked) {
+            setReports([]);
+            setSelectedId("");
+            setMessages([]);
+          }
+          setLoading(false);
+        });
+      }
+    })();
+    return () => controller.abort();
+  }, [reloadKey, router]);
 
   const filtered = useMemo(
     () =>
       reports
-        .filter((r) => statusF === "all" || r.status === statusF)
+        .filter((r) => statusF === "all" || r.workflowStatus === statusF)
         .filter((r) => intensityF === "all" || bucket(maxIntensity(r)) === intensityF)
         .filter((r) => {
           const q = query.trim().toLowerCase();
           return (
             !q ||
             r.participantCode.toLowerCase().includes(q) ||
-            r.analysis.englishSummary.toLowerCase().includes(q)
+            (r.englishSummary ?? "").toLowerCase().includes(q)
           );
         })
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+        .sort((a, b) => b.submittedAt.localeCompare(a.submittedAt)),
     [reports, statusF, intensityF, query],
   );
 
-  const selected = filtered.find((r) => r.id === selectedId) ?? filtered[0];
-  const needsReview = reports.filter((r) => r.status === "new").length;
+  const selected = filtered.find((r) => r.id === selectedId) ?? filtered[0] ?? null;
+  const needsReview = reports.filter((r) => r.workflowStatus === "submitted").length;
 
   // One chat per participant per day.
   const chatKey = selected && today ? dailyChatKey(selected.participantCode, today) : "";
+
+  async function loadMoreReports() {
+    if (nextOffset === null || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const response = await getCoordinatorReports({ limit: 20, offset: nextOffset });
+      setReports((current) => [...current, ...response.reports]);
+      setNextOffset(response.pagination.nextOffset);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        setReports([]);
+        setSelectedId("");
+        setMessages([]);
+        router.replace("/coordinator-login?session=expired");
+        return;
+      }
+      setLoadError(error instanceof Error ? error.message : "More reports could not be loaded.");
+      const blocked = error instanceof ApiError && (
+        error.status === 401 ||
+        error.status === 403 ||
+        error.code === "BROWSER_AUTH_UNAVAILABLE" ||
+        error.code === "COORDINATOR_AUTH_UNAVAILABLE"
+      );
+      setAuthenticationBlocked(blocked);
+      if (blocked) {
+        setReports([]);
+        setSelectedId("");
+        setMessages([]);
+      }
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
+  async function signOut() {
+    if (logoutBusy) return;
+    setLogoutBusy(true);
+    setLoadError(null);
+    try {
+      await logoutBrowserSession();
+      setReports([]);
+      setSelectedId("");
+      setMessages([]);
+      setAssignee({});
+      setQuery("");
+      router.replace("/coordinator-login");
+      router.refresh();
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : "Sign out failed. Please try again.");
+    } finally {
+      setLogoutBusy(false);
+    }
+  }
 
   useEffect(() => {
     startTransition(() => {
@@ -160,35 +279,8 @@ export default function DashboardPage() {
     return subscribeToChatMessages(chatKey, syncMessages);
   }, [chatKey]);
 
-function setStatus(status: ReviewStatus) {
-  if (!selected || !chatKey || !today || selected.status === status) return;
-    // Placeholder: call PATCH /api/reports/[id] here, then update state
-    setReports((rs) => rs.map((r) => (r.id === selected.id ? { ...r, status } : r)));
-
-    const text = autoMessages[status];
-    if (text) {
-        const msg: ChatMessage = {
-        from: "doctor",
-        text,
-        kind: status === "follow_up_requested" ? "follow_up_requested" : "reviewed",
-        auto: true,
-        time: new Date().toLocaleTimeString("en-US", { timeStyle: "short" }),
-        readByPatient: false,
-        };
-        appendChatMessage(chatKey, msg);
-        if (status === "follow_up_requested") {
-          writeFollowUpState(selected.participantCode, {
-            ...readFollowUpState(selected.participantCode),
-            pending: true,
-            appointmentScheduled: false,
-            lastReminderDate: today,
-          });
-        }
-    }
-}
-
   const actionBtn =
-    "min-h-11 w-full whitespace-nowrap rounded-full bg-forest-800 px-4 py-2.5 text-center font-medium text-white transition-all duration-300 ease-out hover:bg-leaf hover:ring-2 hover:ring-glow/70 hover:shadow-lg";
+    "min-h-11 w-full whitespace-nowrap rounded-full bg-forest-800 px-4 py-2.5 text-center font-medium text-white transition-all duration-300 ease-out hover:bg-leaf hover:ring-2 hover:ring-glow/70 hover:shadow-lg disabled:opacity-50";
 
   return (
     <div className="flex min-h-screen flex-col bg-[#c3dccd] bg-gradient-to-br from-[#d8e8dd] via-[#c3dccd] to-[#a8cdbb] text-ink print:bg-none print:bg-white">
@@ -213,6 +305,14 @@ function setStatus(status: ReviewStatus) {
             className="h-10 w-full rounded-full border border-white/15 bg-white/10 px-5 text-white placeholder:text-white/60 transition-all duration-300 ease-out hover:ring-1 hover:ring-glow/60"
           />
         </label>
+        <button
+          type="button"
+          onClick={() => void signOut()}
+          disabled={logoutBusy}
+          className="min-h-10 shrink-0 rounded-full border border-white/25 px-4 text-sm font-medium text-white transition-colors hover:bg-white/10 disabled:opacity-50"
+        >
+          {logoutBusy ? "Signing out…" : "Sign out"}
+        </button>
       </header>
 
       <div className="grid flex-1 gap-4 p-4 lg:grid-cols-[250px_360px_1fr] print:block print:p-0">
@@ -249,9 +349,10 @@ function setStatus(status: ReviewStatus) {
             onChange={setStatusF}
             options={[
               { value: "all", label: "All" },
-              { value: "new", label: "New" },
+              { value: "submitted", label: "Submitted" },
               { value: "follow_up_requested", label: "Follow-up requested" },
               { value: "reviewed", label: "Reviewed" },
+              { value: "closed", label: "Closed" },
             ]}
           />
           <FilterGroup<IntensityF>
@@ -299,9 +400,33 @@ function setStatus(status: ReviewStatus) {
                   Needs review: {needsReview}
                 </span>
               </div>
-              {filtered.length === 0 ? (
-                <p className="text-forest-800">No reports match these filters.</p>
+              {loading ? (
+                <p role="status" className="py-6 text-center text-forest-800">Loading coordinator reports…</p>
+              ) : loadError ? (
+                <div role="alert" className="flex flex-col gap-3 rounded-2xl border border-red-800/20 bg-red-50 p-4 text-sm text-red-900">
+                  <p>{loadError}</p>
+                  {authenticationBlocked && (
+                    <a href="/coordinator-login" className="font-semibold underline">
+                      Open coordinator sign in
+                    </a>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLoading(true);
+                      setReloadKey((key) => key + 1);
+                    }}
+                    className="min-h-10 rounded-full border border-red-900/20 bg-white px-4 font-semibold"
+                  >
+                    Retry
+                  </button>
+                </div>
+              ) : filtered.length === 0 ? (
+                <p className="py-6 text-center text-forest-800">
+                  {reports.length === 0 ? "No submitted reports are available." : "No reports match these filters."}
+                </p>
               ) : (
+                <>
                 <ul className="flex flex-col gap-3">
                   {filtered.map((r) => (
                     <li key={r.id}>
@@ -309,23 +434,34 @@ function setStatus(status: ReviewStatus) {
                         onClick={() => setSelectedId(r.id)}
                         aria-current={selected?.id === r.id}
                         className={`w-full rounded-2xl border-l-8 bg-white/80 p-3 text-left text-ink shadow-sm transition-all duration-300 ease-out hover:-translate-y-0.5 hover:shadow-lg hover:ring-2 hover:ring-glow/70 ${
-                          borderByStatus[r.status]
+                          borderByStatus[r.workflowStatus]
                         } ${selected?.id === r.id ? "ring-2 ring-leaf" : ""}`}
                       >
                         <div className="flex items-center justify-between gap-2">
                           <span className="font-semibold">ID: {r.id}</span>
-                          <StatusBadge status={r.status} />
+                          <StatusBadge status={r.workflowStatus} />
                         </div>
                         <p className="mt-1 text-sm">
-                          {fmtDate(r.createdAt)} · {r.participantCode}
+                          {fmtDate(r.submittedAt)} · {r.participantCode}
                         </p>
                         <p className="mt-1 line-clamp-2 text-sm text-muted">
-                          {r.analysis.englishSummary}
+                          {r.englishSummary ?? "English summary unavailable."}
                         </p>
                       </button>
                     </li>
                   ))}
                 </ul>
+                {nextOffset !== null && (
+                  <button
+                    type="button"
+                    onClick={() => void loadMoreReports()}
+                    disabled={loadingMore}
+                    className="mt-3 min-h-10 w-full rounded-full border border-forest-800/20 bg-white/70 px-4 font-semibold text-forest-800 disabled:opacity-50"
+                  >
+                    {loadingMore ? "Loading…" : "Load more reports"}
+                  </button>
+                )}
+                </>
               )}
             </section>
 
@@ -356,15 +492,15 @@ function setStatus(status: ReviewStatus) {
                         <tr>
                           <th scope="row" className={th}>Submitted</th>
                           <td className={td}>
-                            {fmtDate(selected.createdAt)}, {fmtTime(selected.createdAt)}
+                            {fmtDate(selected.submittedAt)}, {fmtTime(selected.submittedAt)}
                           </td>
                           <th scope="row" className={th}>Reported in</th>
-                          <td className={td}>{langName[selected.language]}</td>
+                          <td className={td}>{formatLanguage(selected.originalLanguage)}</td>
                         </tr>
                         <tr>
                           <th scope="row" className={th}>Status</th>
                           <td className={td}>
-                            <StatusBadge status={selected.status} />
+                            <StatusBadge status={selected.workflowStatus} />
                           </td>
                           <th scope="row" className={th}>
                             <label htmlFor="assign">Assigned to (not saved yet)</label>
@@ -404,15 +540,15 @@ function setStatus(status: ReviewStatus) {
                         <tr>
                           <th scope="row" className={th}>Summary</th>
                           <td className={td} colSpan={3}>
-                            {selected.analysis.englishSummary}
+                            {selected.englishSummary ?? "No English summary was provided."}
                           </td>
                         </tr>
                         <tr>
                           <th scope="row" className={th}>
-                            Participant&apos;s report (English)
+                            Participant&apos;s original report
                           </th>
                           <td className={`${td} italic`} colSpan={3}>
-                            &ldquo;{selected.analysis.englishTranslation}&rdquo;
+                            &ldquo;{selected.originalTranscript}&rdquo;
                           </td>
                         </tr>
                       </tbody>
@@ -439,26 +575,25 @@ function setStatus(status: ReviewStatus) {
                         </tr>
                       </thead>
                       <tbody>
-                        {selected.analysis.symptoms.map((s) => (
+                        {selected.symptoms.map((symptom) => (
                           <tr
-                            key={s.name}
+                            key={symptom.symptomCode}
                             className="transition-all duration-300 ease-out hover:bg-mint/20"
                           >
-                            <td className={`${td} font-semibold capitalize`}>{s.name}</td>
+                            <td className={`${td} font-semibold`}>{symptom.displayName}</td>
                             <td className={td}>
-                              {s.intensity === null ? "Not reported" : `${s.intensity} /10`}
+                              {symptom.reportedIntensity === null ? "Not reported" : `${symptom.reportedIntensity} /10`}
                             </td>
-                            <td className={td}>{s.onsetText ?? "Not reported"}</td>
+                            <td className={td}>{symptom.onsetDate ?? "Not reported"}</td>
                             <td className={td}>
-                              {s.ongoing === null ? "Not reported" : s.ongoing ? "Yes" : "No"}
+                              {symptom.ongoing === null ? "Not reported" : symptom.ongoing ? "Yes" : "No"}
                             </td>
                           </tr>
                         ))}
-                        {selected.analysis.missingFields.length > 0 && (
+                        {selected.symptoms.length === 0 && (
                           <tr>
                             <td className={`${td} text-sm text-muted`} colSpan={4}>
-                              Not reported by participant:{" "}
-                              {selected.analysis.missingFields.join(", ")}
+                              No symptoms were recorded in this report.
                             </td>
                           </tr>
                         )}
@@ -470,11 +605,13 @@ function setStatus(status: ReviewStatus) {
                   <div className="grid grid-cols-3 gap-3 print:hidden">
                     <button
                       className={actionBtn}
-                      onClick={() => setStatus("follow_up_requested")}
+                      type="button"
+                      disabled
+                      title="The coordinator reports API is read-only."
                     >
                       Request follow-up
                     </button>
-                    <button className={actionBtn} onClick={() => setStatus("reviewed")}>
+                    <button className={actionBtn} type="button" disabled title="The coordinator reports API is read-only.">
                       Mark reviewed
                     </button>
                     <button className={actionBtn} onClick={() => window.print()}>
