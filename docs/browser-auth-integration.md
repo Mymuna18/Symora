@@ -152,7 +152,8 @@ Production uses `__Host-symora_session`; local HTTP development uses
 `Path=/`, no `Domain`, and `Secure` in production. JavaScript must never attempt
 to read the cookie. Browser-managed cookies carry subsequent authentication.
 
-For **every login, logout, and cookie-authenticated POST**, send:
+For **every login, logout, and cookie-authenticated state-changing request**
+(including POST and PATCH), send:
 
 ```text
 X-Symora-CSRF: 1
@@ -184,7 +185,8 @@ async function apiJson(path, { method = "GET", body } = {}) {
     credentials: "same-origin",
     cache: "no-store",
     headers: {
-      ...(method === "POST" ? { "X-Symora-CSRF": "1" } : {}),
+      ...(!["GET", "HEAD", "OPTIONS"].includes(method)
+        ? { "X-Symora-CSRF": "1" } : {}),
       ...(body === undefined ? {} : { "Content-Type": "application/json" }),
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),

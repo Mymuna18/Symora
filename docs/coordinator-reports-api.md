@@ -1,8 +1,10 @@
-# Coordinator report retrieval
+# Coordinator reports and review
 
-Elvin-owned backend. `GET /api/coordinator/reports` is a demo-wide coordinator
-read endpoint; it does not grant review/status-edit permissions. No migration is
-needed. It uses the existing database pool and schema.
+`GET /api/coordinator/reports` is the demo-wide coordinator read endpoint. The
+same authenticated coordinator can update statuses through the API documented in
+[coordinator review and participant notifications](./coordinator-review-and-notifications.md).
+No migration is needed; these endpoints use the existing database pool and
+schema.
 
 ## Server configuration
 
@@ -14,13 +16,14 @@ SYMORA_COORDINATOR_AUTH_ENABLED=true
 SYMORA_COORDINATORS='[{"coordinatorId":"demo-coordinator","tokenSha256":"<64-character SHA-256 hex digest>","expiresAt":"<future UTC timestamp, e.g. YYYY-MM-DDTHH:mm:ss.SSSZ>"}]'
 ```
 
-Each coordinator must receive a **new** random bearer token, separate from every
+Each bearer coordinator must receive a **new** random token, separate from every
 participant token. Generate at least 32 random bytes encoded as base64url; store
 only its SHA-256 digest in the configuration. Identity comes from `coordinatorId`
-in that server configuration (1–64 letters, digits, underscores or hyphens), never
-from a request role or participant ID. Canonical UTC expiry is mandatory. Disable
-the feature or remove the digest to revoke access. Missing/invalid configuration
-fails closed, even when participant demo authentication is enabled.
+in server configuration, never from a request role or participant ID. Canonical
+UTC expiry is mandatory. Browser coordinator sessions are also supported when
+the existing browser-auth configuration is enabled. Disable the applicable
+authentication configuration or revoke the credential/session to remove access.
+Missing/invalid configuration fails closed.
 
 Optional local provisioning command (run manually): writes a fresh token and a
 24-hour configuration to private temporary files, printing only their directory.
@@ -48,9 +51,9 @@ NODE
 
 Send `Authorization: Bearer <coordinator-token>` from a trusted local API client
 or server. Use HTTPS when deployed. Do not embed this bearer token in frontend
-code, browser storage or public environment variables. A browser dashboard needs
-a separately approved server-side session/login integration; this endpoint does
-not implement that flow. Participant cookies/tokens alone cannot authorize it.
+code, browser storage or public environment variables. The browser dashboard
+uses the existing coordinator session and must not send bearer credentials.
+Participant cookies/tokens alone cannot authorize coordinator routes.
 
 ## Contract for Shrinika
 
@@ -89,7 +92,7 @@ Reports are ordered by submission time descending, then ID descending. Drafts
 are excluded. Included states: `submitted`, `reviewed`, `follow_up_requested`,
 `closed`. Source is `portal` or `voice`. Codes are returned exactly as stored;
 this schema has no fictional-participant flag, so demo data must be provisioned
-as fictional by the team. This credential can read all submitted reports in the
+as fictional by the team. The coordinator can read all submitted reports in the
 configured database, across trials; it is not a production tenant access model.
 
 `reportedIntensity` is the participant's 0–10 value or null (unknown), never
@@ -99,7 +102,8 @@ or null; `participantDescription` and `englishSummary` are string or null.
 `submittedAt` is an ISO timestamp. No participant UUID or coordinator credential
 is returned. Offset pages can shift if new reports arrive between requests.
 
-Every response has `Cache-Control: no-store` and `Vary: Authorization`. Empty
+Every response has `Cache-Control: no-store` and varies on `Cookie` and
+`Authorization`. Empty
 results return `200` with `reports: []`. Errors have
 `{"error":{"code":"...","message":"..."}}`:
 
@@ -109,6 +113,7 @@ results return `200` with `reports: []`. Errors have
 - `503 REPORTS_UNAVAILABLE`: database retrieval failed; no driver details are exposed.
 - `500 INTERNAL_ERROR`: unexpected failure; no internal details are exposed.
 
-Local verification uses mocks only, including importing the actual route with
-its database module replaced. It does not verify SQL execution against live
-TigerData or alter any database data.
+Status changes and participant messages are documented in
+[coordinator review and participant notifications](./coordinator-review-and-notifications.md).
+Local verification uses mocks only; it does not verify SQL execution against
+live TigerData or alter any database data.
