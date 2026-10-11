@@ -9,20 +9,27 @@ import { DATABASE, SCHEMA, TABLES, OBJECT_NAMES, TYPE_NAMES, MIGRATION_SHA256, v
 import {
   BROWSER_AUTH_TABLES, BROWSER_AUTH_OBJECT_NAMES, BROWSER_AUTH_TYPE_NAMES, verifyBrowserAuthSchema,
 } from "../lib/browser-auth-migration-contract.mjs";
+import {
+  FOLLOW_UP_TABLES, FOLLOW_UP_OBJECT_NAMES, FOLLOW_UP_TYPE_NAMES, verifyFollowUpSchema,
+} from "../lib/follow-up-migration-contract.mjs";
 
 export const CONFIRMATION = "APPLY SYMORA 001 TO tsdb.public";
 export const MIGRATION_URL = new URL("../db/migrations/001_initial_schema.sql", import.meta.url);
 export const BROWSER_AUTH_CONFIRMATION = "APPLY SYMORA 002 TO tsdb.public";
 export const BROWSER_AUTH_MIGRATION_URL = new URL("../db/migrations/002_browser_auth_state.sql", import.meta.url);
+export const FOLLOW_UP_CONFIRMATION = "APPLY SYMORA 003 TO tsdb.public";
+export const FOLLOW_UP_MIGRATION_URL = new URL("../db/migrations/003_participant_follow_up_responses.sql", import.meta.url);
 const MIGRATIONS = Object.freeze({
   "001": { url: MIGRATION_URL, sha256: MIGRATION_SHA256, tables: TABLES, objects: OBJECT_NAMES, types: TYPE_NAMES },
   "002": { url: BROWSER_AUTH_MIGRATION_URL, sha256: "2e68869d2bb21672c88456f85ed84d12d97da335deacc61d346ad0a49e698351",
     tables: BROWSER_AUTH_TABLES, objects: BROWSER_AUTH_OBJECT_NAMES, types: BROWSER_AUTH_TYPE_NAMES },
+  "003": { url: FOLLOW_UP_MIGRATION_URL, sha256: "da3893a28c406eda97a5abf6a960ab8b30cf4f6b4b7583f7c60a7bdb44b421a0",
+    tables: FOLLOW_UP_TABLES, objects: FOLLOW_UP_OBJECT_NAMES, types: FOLLOW_UP_TYPE_NAMES },
 });
 
 export function parseMigrationSelection(args) {
   const versionFlags = args.filter((arg) => arg.startsWith("--migration="));
-  if (versionFlags.length > 1 || args.some((arg) => arg.startsWith("--migration=") && !["--migration=001", "--migration=002"].includes(arg))) {
+  if (versionFlags.length > 1 || args.some((arg) => arg.startsWith("--migration=") && !["--migration=001", "--migration=002", "--migration=003"].includes(arg))) {
     throw new Error("Unsupported migration version.");
   }
   const version = versionFlags[0]?.slice("--migration=".length) ?? "001";
@@ -123,7 +130,8 @@ export async function runMigration({ args = [], confirmation = "", expectedHost,
   try {
     ({ mode, version } = parseMigrationSelection(args));
     migration = MIGRATIONS[version];
-    const requiredConfirmation = version === "001" ? CONFIRMATION : BROWSER_AUTH_CONFIRMATION;
+    const requiredConfirmation = version === "001" ? CONFIRMATION
+      : version === "002" ? BROWSER_AUTH_CONFIRMATION : FOLLOW_UP_CONFIRMATION;
     if (expectedDatabase !== DATABASE || (mode === "execute" && confirmation !== requiredConfirmation)) throw new Error("Approval or target mismatch.");
     const options = inspectionPoolOptions(connectionString, expectedHost, expectedDatabase);
     const sql = verifyMigrationBytes(await loadMigration(version), version);
@@ -151,11 +159,19 @@ export async function runMigration({ args = [], confirmation = "", expectedHost,
     const permissions = (await client.query(queries.permissions, [SCHEMA])).rows[0];
     if (!permissions?.can_use || !permissions.can_create || permissions.external_default_grants !== false
       || !Number.isInteger(permissions.version) || Math.floor(permissions.version / 10000) !== 18) throw new Error("Permissions or PostgreSQL version require review.");
-    if (version === "002") {
+    if (version === "002" || version === "003") {
       stage = "base-schema verification";
       const baseline = {};
       for (const key of ["tables", "columns", "constraints", "indexes"]) baseline[key] = (await client.query(queries[key], [SCHEMA, TABLES])).rows;
       verifySchema(baseline);
+    }
+    if (version === "003") {
+      stage = "browser-auth schema verification";
+      const baseline = {};
+      for (const key of ["tables", "columns", "constraints", "indexes"]) {
+        baseline[key] = (await client.query(queries[key], [SCHEMA, BROWSER_AUTH_TABLES])).rows;
+      }
+      verifyBrowserAuthSchema(baseline);
     }
     stage = "identity/permissions/conflicts";
     const conflicts = (await client.query(metadataQueries.conflicts, [SCHEMA, migration.objects, migration.types])).rows;
@@ -166,10 +182,12 @@ export async function runMigration({ args = [], confirmation = "", expectedHost,
       await client.query(sql);
       stage = "schema verification";
       const snapshot = {};
-      const allTables = version === "001" ? TABLES : [...TABLES, ...BROWSER_AUTH_TABLES];
+      const allTables = version === "001" ? TABLES
+        : version === "002" ? [...TABLES, ...BROWSER_AUTH_TABLES]
+          : [...TABLES, ...BROWSER_AUTH_TABLES, ...FOLLOW_UP_TABLES];
       for (const key of ["tables", "columns", "constraints", "indexes"]) snapshot[key] = (await client.query(queries[key], [SCHEMA, allTables])).rows;
       if (version === "001") verifySchema(snapshot);
-      else {
+      else if (version === "002") {
         const baseSnapshot = {};
         const authSnapshot = {};
         for (const key of ["tables", "columns", "constraints", "indexes"]) {
@@ -181,6 +199,22 @@ export async function runMigration({ args = [], confirmation = "", expectedHost,
         verifySchema(baseSnapshot);
         stage = "browser-auth schema verification";
         verifyBrowserAuthSchema(authSnapshot);
+      } else {
+        const baseSnapshot = {};
+        const authSnapshot = {};
+        const followUpSnapshot = {};
+        for (const key of ["tables", "columns", "constraints", "indexes"]) {
+          const tableOf = key === "tables" ? (row) => row.name : (row) => row.table;
+          baseSnapshot[key] = snapshot[key].filter((row) => TABLES.includes(tableOf(row)));
+          authSnapshot[key] = snapshot[key].filter((row) => BROWSER_AUTH_TABLES.includes(tableOf(row)));
+          followUpSnapshot[key] = snapshot[key].filter((row) => FOLLOW_UP_TABLES.includes(tableOf(row)));
+        }
+        stage = "base schema verification";
+        verifySchema(baseSnapshot);
+        stage = "browser-auth schema verification";
+        verifyBrowserAuthSchema(authSnapshot);
+        stage = "participant follow-up schema verification";
+        verifyFollowUpSchema(followUpSnapshot);
       }
       if (connectionFailed) throw new Error("Connection failed.");
       stage = "commit";
@@ -230,7 +264,8 @@ export async function main() {
   const args = process.argv.slice(2);
   const { mode, version } = parseMigrationSelection(args);
   if (!process.stdin.isTTY) throw new Error("Interactive confirmation required.");
-  const requiredConfirmation = version === "001" ? CONFIRMATION : BROWSER_AUTH_CONFIRMATION;
+  const requiredConfirmation = version === "001" ? CONFIRMATION
+    : version === "002" ? BROWSER_AUTH_CONFIRMATION : FOLLOW_UP_CONFIRMATION;
   console.log(`Symora ${version} ${mode}. Enter expected development details from TigerData's console. Never enter a password or connection string.`);
   const terminal = createInterface({ input: process.stdin, output: process.stdout });
   let expectedHost, expectedDatabase, confirmation = "";

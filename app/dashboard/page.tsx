@@ -12,14 +12,6 @@ import {
   updateCoordinatorReportStatus,
   type ReviewStatusInput,
 } from "@/lib/coordinator-review-api";
-import {
-  appendChatMessage,
-  dailyChatKey,
-  readChatMessages,
-  subscribeToChatMessages,
-  writeFollowUpState,
-  type ChatMessage,
-} from "@/lib/chat";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import type { CoordinatorReport, CoordinatorWorkflowStatus } from "@/types/reports";
 
@@ -64,48 +56,6 @@ const glass = "border border-white/60 bg-white/40 shadow-lg backdrop-blur-md";
 const th =
   "w-44 border border-forest-800/25 bg-sage/70 px-3 py-2 text-sm font-semibold text-forest-800";
 const td = "border border-forest-800/25 px-3 py-2";
-
-// Demo notification: written to this browser's chat store, which the participant
-// page reads (same browser only). The participant page shows the translated text
-// based on `kind`; `text` is the English fallback.
-function notifyParticipant(
-  participantCode: string,
-  status: "reviewed" | "follow_up_requested",
-) {
-  try {
-    const day = new Date().toLocaleDateString("en-CA");
-    const key = dailyChatKey(participantCode, day);
-    const time = new Date().toLocaleTimeString("en-US", { timeStyle: "short" });
-    if (status === "reviewed") {
-      appendChatMessage(key, {
-        from: "doctor",
-        text: "Your doctor has reviewed your symptom report. Thank you for sharing how you are feeling.",
-        kind: "reviewed",
-        auto: true,
-        time,
-        readByPatient: false,
-      });
-      return;
-    }
-    appendChatMessage(key, {
-      from: "doctor",
-      text: "Your doctor would like to follow up with you about your report. Please contact your doctor to schedule an appointment. If it is an emergency, call 911.",
-      kind: "follow_up_requested",
-      auto: true,
-      time,
-      readByPatient: false,
-    });
-    // Daily reminders start tomorrow; today's first message already counts.
-    writeFollowUpState(participantCode, {
-      pending: true,
-      appointmentScheduled: false,
-      lastReminderDate: day,
-    });
-  } catch {
-    // The server update already succeeded; a browser-storage problem must not
-    // be reported as a failed review.
-  }
-}
 
 function fmtDate(iso: string) {
   return new Date(iso).toLocaleDateString("en-US", { dateStyle: "medium" });
@@ -175,8 +125,6 @@ export default function DashboardPage() {
   const [intensityF, setIntensityF] = useState<IntensityF>("all");
   const [query, setQuery] = useState("");
   const [assignee, setAssignee] = useState<Record<string, string>>({});
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [today, setToday] = useState("");
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -220,7 +168,6 @@ export default function DashboardPage() {
           startTransition(() => {
             setReports([]);
             setSelectedId("");
-            setMessages([]);
             router.replace("/coordinator-login?session=expired");
           });
           return;
@@ -237,7 +184,6 @@ export default function DashboardPage() {
           if (blocked) {
             setReports([]);
             setSelectedId("");
-            setMessages([]);
           }
           setLoading(false);
         });
@@ -272,8 +218,6 @@ export default function DashboardPage() {
   const canRequestFollowUp =
     selected?.workflowStatus === "submitted" || selected?.workflowStatus === "reviewed";
 
-  // One chat per participant per day.
-  const chatKey = selected && today ? dailyChatKey(selected.participantCode, today) : "";
 
   // Clear any action error whenever a different report is shown.
   const selectedReportId = selected?.id ?? "";
@@ -294,7 +238,6 @@ export default function DashboardPage() {
       if (error instanceof ApiError && error.status === 401) {
         setReports([]);
         setSelectedId("");
-        setMessages([]);
         router.replace("/coordinator-login?session=expired");
         return;
       }
@@ -309,7 +252,6 @@ export default function DashboardPage() {
       if (blocked) {
         setReports([]);
         setSelectedId("");
-        setMessages([]);
       }
     } finally {
       setLoadingMore(false);
@@ -319,7 +261,6 @@ export default function DashboardPage() {
   async function changeStatus(input: ReviewStatusInput) {
     if (!selected || statusBusy) return;
     const reportId = selected.id;
-    const participantCode = selected.participantCode;
     setBusyAction(input.workflowStatus);
     setActionError(null);
     try {
@@ -332,12 +273,10 @@ export default function DashboardPage() {
             : report,
         ),
       );
-      notifyParticipant(participantCode, result.report.workflowStatus as "reviewed" | "follow_up_requested");
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) {
         setReports([]);
         setSelectedId("");
-        setMessages([]);
         router.replace("/coordinator-login?session=expired");
         return;
       }
@@ -357,7 +296,6 @@ export default function DashboardPage() {
       await logoutBrowserSession();
       setReports([]);
       setSelectedId("");
-      setMessages([]);
       setAssignee({});
       setQuery("");
       router.replace("/coordinator-login");
@@ -368,18 +306,6 @@ export default function DashboardPage() {
       setLogoutBusy(false);
     }
   }
-
-  useEffect(() => {
-    startTransition(() => {
-      setToday(new Date().toLocaleDateString("en-CA"));
-    });
-  }, []);
-
-  useEffect(() => {
-    const syncMessages = (next: ChatMessage[]) => setMessages(next);
-    syncMessages(readChatMessages(chatKey));
-    return subscribeToChatMessages(chatKey, syncMessages);
-  }, [chatKey]);
 
   const actionBtn =
     "min-h-11 w-full whitespace-nowrap rounded-full bg-forest-800 px-4 py-2.5 text-center font-medium text-white transition-all duration-300 ease-out hover:bg-leaf hover:ring-2 hover:ring-glow/70 hover:shadow-lg disabled:opacity-50";
@@ -751,52 +677,26 @@ export default function DashboardPage() {
                     </p>
                   )}
 
-                  {/* Chat: fills the remaining space */}
+                  {/* In-app notification delivery is backed by report and review history records. */}
                   <section
-                    aria-label={`Message ${selected.participantCode}`}
+                    aria-label="Participant follow-up notifications"
                     className="flex min-h-64 flex-1 flex-col overflow-hidden rounded-2xl border border-forest-800/25 bg-white/90 print:hidden"
                   >
                     <div className="flex items-center justify-between gap-2 border-b border-forest-800/20 bg-sage/60 px-4 py-2">
                       <h3 className="font-semibold text-forest-800">
-                        Message {selected.participantCode}
+                        Participant notifications
                       </h3>
                       <span className="whitespace-nowrap text-xs text-muted">
-                        Automated messages · same browser only
+                        In-app · database-backed
                       </span>
                     </div>
 
-                    <div
-                      aria-live="polite"
-                      className="flex max-h-64 flex-1 flex-col gap-2 overflow-y-auto p-4"
-                    >
-                      {messages.length === 0 ? (
-                        <p className="m-auto text-sm text-muted">
-                          No automated messages today.
-                        </p>
-                      ) : (
-                        messages.map((m, i) => (
-                          <div
-                            key={i}
-                            className={`max-w-[80%] rounded-2xl px-4 py-2 ${
-                              m.from === "doctor"
-                                ? "self-end bg-forest-800 text-white"
-                                : "self-start bg-sage text-ink"
-                            }`}
-                          >
-                        {m.auto && (
-                            <p className="mb-0.5 text-xs font-semibold uppercase tracking-wide opacity-70">
-                                Automated message
-                            </p>
-                        )}
-                        <p>{m.text}</p>
-                            <p className="mt-0.5 text-right text-xs opacity-70">{m.time}</p>
-                          </div>
-                        ))
-                      )}
-                    </div>
+                    <p className="flex-1 p-4 text-sm text-muted">
+                      Reviewed and follow-up updates saved for this report appear in the participant’s authenticated Notification Center when it is opened or refreshed. Symora does not send email, SMS, or background notifications.
+                    </p>
 
                     <p className="border-t border-forest-800/20 px-4 py-2 text-xs text-muted">
-                      Demo only: automated messages are stored in this browser. Not for emergencies.
+                      In-app messages are not emergency alerts.
                     </p>
                   </section>
                 </>

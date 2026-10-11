@@ -30,7 +30,10 @@ export async function updateCoordinatorReportStatus(
   try {
     response = await fetch(`/api/coordinator/reports/${encodeURIComponent(reportId)}/status`, {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Symora-CSRF": "1",
+      },
       body: JSON.stringify(input),
       credentials: "same-origin",
       cache: "no-store",
