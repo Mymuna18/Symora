@@ -1,4 +1,4 @@
-# TigerData migration 001 — Elvin-owned tooling
+# TigerData migration 001 
 
 The runner is implemented, but execution against TigerData is not yet approved.
 No seed data, GRANT, REVOKE, or migration-tracking table is included. Muna's
