@@ -1,10 +1,10 @@
-import { authenticateDemoParticipant } from "../../../../lib/demo-auth.mjs";
+import { authenticateParticipantRequest, withPrivateResponse } from "../../../../lib/request-auth.mjs";
 import { getPool } from "../../../../lib/db.mjs";
 import { createReportPreparationHandler } from "../../../../lib/report-analysis.mjs";
 
 
-export const POST = createReportPreparationHandler({
-  authenticate: authenticateDemoParticipant,
+export const POST = withPrivateResponse(createReportPreparationHandler({
+  authenticate: authenticateParticipantRequest,
   loadCatalog: async () => {
     const result = await getPool().query(
       "SELECT code, display_name FROM symptoms WHERE is_active = TRUE ORDER BY display_name, code",
@@ -14,4 +14,4 @@ export const POST = createReportPreparationHandler({
       displayName: row.display_name,
     }));
   },
-});
+}));
