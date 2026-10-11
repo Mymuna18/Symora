@@ -21,7 +21,7 @@ registerHooks({ resolve(specifier, context, nextResolve) {
       globalThis.__browserWorkflow.providerCalls++; return {text: JSON.stringify(globalThis.__browserWorkflow.analysis)};
     }}; }}
   `) };
-  if (specifier.endsWith("/lib/db.mjs")) return { shortCircuit: true,
+  if (specifier === "./db.mjs" || specifier.endsWith("/lib/db.mjs")) return { shortCircuit: true,
     url: moduleUrl("export const getPool = () => globalThis.__browserWorkflow.pool;") };
   return nextResolve(specifier, context);
 } });
@@ -62,11 +62,26 @@ beforeEach(() => {
     ...(role === "participant" ? { participantId } : { coordinatorId: "demo-coordinator" }),
   })));
   process.env.GEMINI_API_KEY = "fictional-key-only";
-  const authState = globalThis[Symbol.for("symora.browser-auth.v1")];
-  authState.sessions.clear(); authState.attempts.clear();
-  const state = { analysis, providerCalls: 0, sql: [], pool: null };
+  const state = { analysis, providerCalls: 0, sql: [], sessions: new Map(), rateLimits: new Map(), pool: null };
   const query = async (sql, values) => {
     state.sql.push({ sql, values });
+    if (sql.includes("SELECT account_key_hash") && sql.includes("FROM browser_auth_sessions")) {
+      const row = state.sessions.get(values[0]);
+      return { rows: row && row.expires > Date.now() ? [{
+        account_key_hash: row.accountKeyHash, role: row.role,
+        config_fingerprint: row.configFingerprint, expires_ms: String(row.expires),
+      }] : [] };
+    }
+    if (sql.includes("INSERT INTO rate_limit_buckets")) {
+      const [scope, hash, windowMs, cap] = values;
+      const key = `${scope}:${hash}`;
+      let bucket = state.rateLimits.get(key);
+      if (!bucket || bucket.expires <= Date.now()) bucket = { attempts: 0, expires: Date.now() + windowMs };
+      bucket.attempts = Math.min(bucket.attempts + 1, cap);
+      state.rateLimits.set(key, bucket);
+      return { rows: [{ attempts: bucket.attempts, expires_at: new Date(bucket.expires) }] };
+    }
+    if (sql.includes("DELETE FROM browser_auth_sessions") && values?.length) state.sessions.delete(values[0]);
     if (sql.includes("WITH page")) return { rows: [{ id: reportId, participantCode: "DEMO-001", workflowStatus: "submitted", symptoms: [] }] };
     if (sql.includes("SELECT code, display_name")) return { rows: [{ code: "headache", display_name: "Headache" }] };
     if (sql.includes("FROM participants")) return { rows: [{ id: participantId }] };
@@ -75,6 +90,21 @@ beforeEach(() => {
     return { rows: [] };
   };
   state.pool = { query, connect: async () => ({ query, release() {} }) };
+  state.pool.connect = async () => ({
+    query: async (sql, values = []) => {
+      state.sql.push({ sql, values });
+      if (sql.includes("DELETE FROM browser_auth_sessions")) state.sessions.delete(values[0]);
+      if (sql.includes("INSERT INTO browser_auth_sessions")) state.sessions.set(values[0], {
+        accountKeyHash: values[1], role: values[2], configFingerprint: values[3],
+        expires: new Date(values[5]).getTime(),
+      });
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK"
+        || sql.includes("INSERT INTO browser_auth_sessions")
+        || sql.includes("DELETE FROM browser_auth_sessions")) return { rows: [] };
+      return query(sql, values);
+    },
+    release() {},
+  });
   globalThis.__browserWorkflow = state;
 });
 
@@ -95,7 +125,7 @@ test("actual cookie login -> analyze -> prepare -> confirm/save -> logout -> coo
     symptoms: [{ symptomCode: draft.symptoms[0].suggestedSymptomCode, reportedIntensity: 4,
       onsetDate: null, ongoing: null, participantDescription: draft.symptoms[0].sourceExcerpt }],
   }, cookie, { "x-participant-id": "forged", "x-role": "coordinator" }));
-  assert.equal(submitted.status, 201);
+  assert.equal(submitted.status, 201, await submitted.clone().text());
   assert.equal((await submitted.json()).report.id, reportId);
   assert.equal(globalThis.__browserWorkflow.sql.find(({ sql }) => sql.includes("INSERT INTO reports")).values[0], participantId);
   assert.equal((await logout(request("/api/auth/logout", undefined, cookie))).status, 204);
@@ -117,7 +147,7 @@ test("actual routes enforce session role before touching private data or provide
     assert.match(response.headers.get("vary"), /Cookie/);
   }
   assert.equal(globalThis.__browserWorkflow.providerCalls, 0);
-  assert.deepEqual(globalThis.__browserWorkflow.sql, []);
+  assert.equal(globalThis.__browserWorkflow.sql.some(({ sql }) => sql.includes("INSERT INTO reports")), false);
 });
 
 test("every participant endpoint rejects cross-origin cookie writes before services", async () => {
@@ -127,12 +157,12 @@ test("every participant endpoint rejects cross-origin cookie writes before servi
     assert.equal((await handler(request("/", {}, cookie, { "x-symora-csrf": "" }))).status, 403);
   }
   assert.equal(globalThis.__browserWorkflow.providerCalls, 0);
-  assert.deepEqual(globalThis.__browserWorkflow.sql, []);
+  assert.equal(globalThis.__browserWorkflow.sql.some(({ sql }) => sql.includes("INSERT INTO reports")), false);
 });
 
 test("anonymous/expired browser sessions cannot reach protected endpoints", async () => {
   const cookie = await login("participant");
-  for (const state of globalThis[Symbol.for("symora.browser-auth.v1")].sessions.values()) state.expires = Date.now() - 1;
+  for (const state of globalThis.__browserWorkflow.sessions.values()) state.expires = Date.now() - 1;
   for (const handler of [analyze, prepare, submit]) {
     assert.equal((await handler(request("/", {}, cookie))).status, 401);
     assert.equal((await handler(request("/", {}))).status, 401);
@@ -140,5 +170,5 @@ test("anonymous/expired browser sessions cannot reach protected endpoints", asyn
   assert.equal((await coordinator(request("/", undefined, cookie, {}, "GET"))).status, 401);
   assert.deepEqual(await (await session(request("/", undefined, cookie, {}, "GET"))).json(), { authenticated: false });
   assert.equal(globalThis.__browserWorkflow.providerCalls, 0);
-  assert.deepEqual(globalThis.__browserWorkflow.sql, []);
+  assert.equal(globalThis.__browserWorkflow.sql.some(({ sql }) => sql.includes("INSERT INTO reports")), false);
 });

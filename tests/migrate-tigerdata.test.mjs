@@ -1,11 +1,19 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { runMigration, parseMigrationArguments, verifyMigrationBytes, queries, CONFIRMATION } from "../scripts/migrate-tigerdata.mjs";
+import {
+  runMigration, parseMigrationArguments, parseMigrationSelection, verifyMigrationBytes, queries,
+  CONFIRMATION, BROWSER_AUTH_CONFIRMATION,
+} from "../scripts/migrate-tigerdata.mjs";
 import { metadataQueries } from "../scripts/inspect-tigerdata.mjs";
 import { columns, checks, keys, foreignKeys, indexes, TABLES, checkTree, verifySchema } from "../lib/migration-contract.mjs";
+import {
+  BROWSER_AUTH_TABLES, browserAuthColumns, browserAuthChecks, browserAuthKeys, browserAuthIndexes,
+  verifyBrowserAuthSchema,
+} from "../lib/browser-auth-migration-contract.mjs";
 
 const migration = readFileSync(new URL("../db/migrations/001_initial_schema.sql", import.meta.url));
+const browserAuthMigration = readFileSync(new URL("../db/migrations/002_browser_auth_state.sql", import.meta.url));
 const secret = "MOCK_SECRET_NEVER_LOG";
 const expectedHost = "synthetic.example.invalid";
 const execute = ["--execute", "--approve-migration=001"];
@@ -25,11 +33,26 @@ function snapshot18() {
   };
 }
 
+function browserAuthSnapshot18() {
+  const base = { validated: true, enforced: true, deferrable: false, deferred: false };
+  return {
+    tables: BROWSER_AUTH_TABLES.map((name) => ({ name, schema: "public", kind: "r", persistence: "p", owned: true, row_security: false })),
+    columns: Object.entries(browserAuthColumns).flatMap(([table, entries]) => entries.map(([name, type, not_null, default_expression]) => ({ table, name, type, not_null, default_expression }))),
+    constraints: [
+      ...browserAuthKeys.map((key) => ({ ...base, ...key, kind: "p" })),
+      ...browserAuthChecks.map(([table, name, expression]) => ({ ...base, table, name, expression, kind: "c" })),
+      ...Object.entries(browserAuthColumns).flatMap(([table, entries]) => entries.filter((entry) => entry[2]).map(([name]) => ({ ...base, table, name: `${table}_${name}_not_null`, kind: "n", columns: [name] }))),
+    ],
+    indexes: browserAuthIndexes.map((index) => ({ ...index, schema: "public", nulls_first: index.descending, method: "btree", valid: true, ready: true, partial: false, expression: false, included: false })),
+  };
+}
+
 function setup(settings = {}) {
   const calls = [], logs = [], errors = [], released = [], options = [];
   let opened = 0, closed = 0;
   let clientErrorListener;
   const snapshot = snapshot18();
+  const browserAuthSnapshot = browserAuthSnapshot18();
   settings.mutate?.(snapshot);
   const client = {
     on(event, listener) { assert.equal(event, "error"); clientErrorListener = listener; },
@@ -46,17 +69,22 @@ function setup(settings = {}) {
       if (sql === queries.permissions) return { rows: [{ can_use: true, can_create: true, version: 180006, external_default_grants: false, ...settings.permissions }] };
       if (sql === queries.lock) return { rows: [{ locked: settings.locked ?? true }] };
       if (sql === metadataQueries.conflicts) return { rows: settings.conflicts ?? [] };
-      for (const key of ["tables", "columns", "constraints", "indexes"]) if (sql === queries[key]) return { rows: snapshot[key] };
+      for (const key of ["tables", "columns", "constraints", "indexes"]) if (sql === queries[key]) {
+        const requested = values?.[1] ?? TABLES;
+        if (requested.length === TABLES.length) return { rows: snapshot[key] };
+        const rows = [...snapshot[key], ...browserAuthSnapshot[key]];
+        return { rows: rows.filter((row) => requested.includes(key === "tables" ? row.name : row.table)) };
+      }
       if (sql === "COMMIT") return { command: settings.commitCommand ?? "COMMIT", rows: [] };
       return { rows: [] };
     },
     release(destroy) { released.push(destroy); if (settings.releaseFails) throw new Error(secret); },
   };
   const run = () => runMigration({
-    args: settings.args ?? [], confirmation: settings.confirmation ?? CONFIRMATION,
+    args: settings.args ?? [], confirmation: settings.confirmation ?? (settings.args?.includes("--migration=002") ? BROWSER_AUTH_CONFIRMATION : CONFIRMATION),
     expectedHost: settings.expectedHost ?? expectedHost, expectedDatabase: settings.expectedDatabase ?? "tsdb",
     connectionString: settings.connectionString ?? `postgresql://mock:${secret}@${expectedHost}:5432/tsdb?sslmode=require`,
-    loadMigration: async () => settings.bytes ?? migration,
+    loadMigration: async (version) => settings.bytes ?? (version === "002" ? browserAuthMigration : migration),
     makeDatabase: (config, onError) => {
       options.push(config);
       return {
@@ -73,6 +101,8 @@ test("reviewed migration bytes pass the pinned checksum; every byte matters", ()
   assert.equal(verifyMigrationBytes(migration), migration.toString("utf8"));
   assert.throws(() => verifyMigrationBytes(Buffer.concat([migration, Buffer.from("\n")])));
   assert.throws(() => verifyMigrationBytes(migration.toString("utf8")));
+  assert.equal(verifyMigrationBytes(browserAuthMigration, "002"), browserAuthMigration.toString("utf8"));
+  assert.throws(() => verifyMigrationBytes(Buffer.concat([browserAuthMigration, Buffer.from("\n")]), "002"));
 });
 
 test("verification manifest matches all explicit index definitions in the reviewed file", () => {
@@ -92,6 +122,52 @@ test("execution requires exactly both approval flags; default is preflight", () 
   assert.equal(parseMigrationArguments(["--preflight"]), "preflight");
   assert.equal(parseMigrationArguments(execute), "execute");
   for (const args of [["--execute"], ["--approve-migration=001"], [...execute, "--preflight"], ["--execute", "--execute"], ["postgres://secret"], ["--execute", "--approve-migration=002"]]) assert.throws(() => parseMigrationArguments(args));
+  assert.deepEqual(parseMigrationSelection(["--migration=002"]), { mode: "preflight", version: "002" });
+  assert.deepEqual(parseMigrationSelection(["--migration=002", "--execute", "--approve-migration=002"]), { mode: "execute", version: "002" });
+  assert.throws(() => parseMigrationSelection(["--migration=002", "--execute", "--approve-migration=001"]));
+});
+
+test("migration 002 contract matches its explicit SQL tables, constraints, and indexes", () => {
+  verifyBrowserAuthSchema(browserAuthSnapshot18());
+  assert.match(browserAuthMigration.toString("utf8"), /PRIMARY KEY \(scope, bucket_hash\)/);
+  assert.match(browserAuthMigration.toString("utf8"), /CREATE INDEX rate_limit_buckets_expires_idx/);
+  assert.match(queries.indexes, /indisvalid/);
+});
+
+test("002 preflight verifies migration 001 and detects conflicts without DDL", async () => {
+  const state = setup({ args: ["--migration=002"] });
+  assert.equal(await state.run(), true);
+  assert.deepEqual(state.calls.map(({ sql }) => sql), [
+    "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", metadataQueries.identity, queries.permissions,
+    queries.tables, queries.columns, queries.constraints, queries.indexes, metadataQueries.conflicts, "ROLLBACK",
+  ]);
+  assert.equal(JSON.parse(state.logs[0]).status, "PREFLIGHT_002_PASSED_NO_CHANGES");
+  assert.ok(!state.calls.some(({ sql }) => sql === browserAuthMigration.toString("utf8")));
+});
+
+test("approved migration 002 checks the baseline and verifies shared-state schema before commit", async () => {
+  const state = setup({ args: ["--migration=002", "--execute", "--approve-migration=002"] });
+  assert.equal(await state.run(), true);
+  assert.deepEqual(state.calls.map(({ sql }) => sql), [
+    "BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE", queries.lock, metadataQueries.identity,
+    queries.permissions, queries.tables, queries.columns, queries.constraints, queries.indexes,
+    metadataQueries.conflicts, browserAuthMigration.toString("utf8"),
+    queries.tables, queries.columns, queries.constraints, queries.indexes, "COMMIT",
+  ]);
+  assert.equal(JSON.parse(state.logs[0]).status, "MIGRATION_002_COMMITTED");
+  assert.equal(state.options[0].application_name, "symora-migration-002");
+});
+
+test("002 stops before DDL if the baseline is not the verified 001 schema or auth names conflict", async () => {
+  for (const config of [
+    { mutate: (snapshot) => { snapshot.tables.pop(); } },
+    { conflicts: [{ name: "browser_auth_sessions", kind: "relation" }] },
+  ]) {
+    const state = setup({ ...config, args: ["--migration=002", "--execute", "--approve-migration=002"] });
+    assert.equal(await state.run(), false);
+    assert.ok(!state.calls.some(({ sql }) => sql === browserAuthMigration.toString("utf8") || sql === "COMMIT"));
+    assert.equal(state.calls.at(-1).sql, "ROLLBACK");
+  }
 });
 
 test("default preflight runs metadata only, then rollback; no DDL, lock, or commit", async () => {
@@ -101,7 +177,7 @@ test("default preflight runs metadata only, then rollback; no DDL, lock, or comm
     "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", metadataQueries.identity,
     queries.permissions, metadataQueries.conflicts, "ROLLBACK",
   ]);
-  assert.equal(JSON.parse(state.logs[0]).status, "PREFLIGHT_PASSED_NO_CHANGES");
+  assert.equal(JSON.parse(state.logs[0]).status, "PREFLIGHT_001_PASSED_NO_CHANGES");
   assert.equal(state.closed(), 1);
   assert.deepEqual(state.released, [false]);
 });
@@ -123,7 +199,7 @@ for (const config of [
 
 test("approved execution checks conflicts immediately before the immutable SQL and verifies before commit", async () => {
   const state = setup({ args: execute });
-  assert.equal(await state.run(), true);
+  assert.equal(await state.run(), true, state.errors.join(" "));
   assert.deepEqual(state.calls.map(({ sql }) => sql), [
     "BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE", queries.lock, metadataQueries.identity,
     queries.permissions, metadataQueries.conflicts, migration.toString("utf8"),

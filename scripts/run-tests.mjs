@@ -49,6 +49,8 @@ export const NextResponse = {
 };
 `;
 const mockNextServerUrl = `data:text/javascript,${encodeURIComponent(mockNextServer)}`;
+const mockDatabase = `export const getPool = () => globalThis.__analyzeTestPool;`;
+const mockDatabaseUrl = `data:text/javascript,${encodeURIComponent(mockDatabase)}`;
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier === "@google/genai") {
@@ -56,6 +58,9 @@ registerHooks({
     }
     if (specifier === "next/server") {
       return { url: mockNextServerUrl, shortCircuit: true };
+    }
+    if (specifier === "./db.mjs" || specifier.endsWith("/lib/db.mjs")) {
+      return { url: mockDatabaseUrl, shortCircuit: true };
     }
     return nextResolve(specifier, context);
   },
@@ -74,6 +79,20 @@ process.env.NODE_ENV = "test";
 process.env.SYMORA_DEMO_AUTH_ENABLED = "true";
 process.env.SYMORA_DEMO_PARTICIPANTS = JSON.stringify(testAuthParticipants);
 globalThis.__geminiMock = { text: "", error: null, calls: [] };
+globalThis.__analysisRateBuckets = new Map();
+globalThis.__analyzeTestPool = {
+  async query(sql, values = []) {
+    if (!sql.includes("INSERT INTO rate_limit_buckets")) return { rows: [] };
+    const [scope, hash, windowMs, cap] = values;
+    const key = `${scope}:${hash}`;
+    const now = Date.now();
+    let bucket = globalThis.__analysisRateBuckets.get(key);
+    if (!bucket || bucket.expires <= now) bucket = { attempts: 0, expires: now + windowMs };
+    bucket.attempts = Math.min(bucket.attempts + 1, cap);
+    globalThis.__analysisRateBuckets.set(key, bucket);
+    return { rows: [{ attempts: bucket.attempts, expires_at: new Date(bucket.expires) }] };
+  },
+};
 
 const { POST } = await import("../app/api/analyze/route.ts");
 const fixture = JSON.parse(
@@ -531,6 +550,7 @@ try {
     process.env.GEMINI_MODEL = "";
     process.env.GEMINI_FALLBACK_MODEL = "";
     setGeminiResponse(validGeminiOutput());
+    globalThis.__analysisRateBuckets.clear();
     const { POST: isolatedPost } = await import("../app/api/analyze/route.ts?rate-limit-test");
     let lastResponse;
     for (let index = 0; index < 120; index++) {
@@ -545,6 +565,14 @@ try {
       { "x-forwarded-for": "another-spoofed-address" }
     ));
     await assertErrorResponse(blocked, 429, "Rate limit");
+  });
+
+  await test("shared limiter failures fail closed before calling Gemini", async () => {
+    globalThis.__analyzeTestPool.query = async () => { throw new Error("synthetic store outage"); };
+    setGeminiResponse(validGeminiOutput());
+    const response = await post({ language: "en", transcript: "I have a headache" });
+    await assertErrorResponse(response, 503, "Authentication unavailable");
+    assert.equal(globalThis.__geminiMock.calls.length, 0);
   });
 } finally {
   if (originalApiKey === undefined) {

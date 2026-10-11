@@ -26,7 +26,8 @@ registerHooks({
       }}; }}
     `) };
     if (specifier === "next/server") return { shortCircuit: true, url: dataModule("export const NextResponse = {json: (body, init) => Response.json(body, init)};") };
-    if (specifier.endsWith("/lib/db.mjs") && new URL(specifier, context.parentURL).href === dbUrl) return {
+    if ((specifier === "./db.mjs" || specifier.endsWith("/lib/db.mjs"))
+      && (specifier === "./db.mjs" || new URL(specifier, context.parentURL).href === dbUrl)) return {
       shortCircuit: true, url: dataModule("export const getPool = () => globalThis.__symoraWorkflow.pool;"),
     };
     return nextResolve(specifier, context);
@@ -50,9 +51,18 @@ const request = (path, body, authorized = true) => new Request(`http://localhost
 });
 beforeEach(() => {
   auth();
-  const state = { analysis: output(), geminiCalls: 0, sql: [], pool: null };
+  const state = { analysis: output(), geminiCalls: 0, sql: [], rateLimits: new Map(), pool: null };
   const query = async (sql, values) => {
     state.sql.push({ sql, values });
+    if (sql.includes("INSERT INTO rate_limit_buckets")) {
+      const [scope, hash, windowMs, cap] = values;
+      const key = `${scope}:${hash}`;
+      let bucket = state.rateLimits.get(key);
+      if (!bucket || bucket.expires <= Date.now()) bucket = { attempts: 0, expires: Date.now() + windowMs };
+      bucket.attempts = Math.min(bucket.attempts + 1, cap);
+      state.rateLimits.set(key, bucket);
+      return { rows: [{ attempts: bucket.attempts, expires_at: new Date(bucket.expires) }] };
+    }
     if (sql.includes("SELECT code, display_name")) return { rows: DEMO_CATALOG.map(({ code, displayName }) => ({ code, display_name: displayName })) };
     if (sql.includes("FROM participants")) return { rows: [{ id: participant }] };
     if (sql.includes("SELECT id, code FROM symptoms")) return { rows: [{ id: "33333333-3333-4333-8333-333333333333", code: "headache" }] };

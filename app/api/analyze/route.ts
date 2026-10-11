@@ -1,5 +1,6 @@
 import { GoogleGenAI, Type, type GenerateContentParameters } from "@google/genai";
 import { authenticateParticipantRequest, withPrivateResponse } from "../../../lib/request-auth.mjs";
+import { enforceSharedAnalysisRateLimit } from "../../../lib/browser-auth-runtime.mjs";
 import { ReportError } from "../../../lib/report-errors.mjs";
 
 const SUPPORTED_LANGUAGES = ["en", "es", "vi", "zh"] as const;
@@ -159,25 +160,6 @@ async function readRequestText(request: Request): Promise<string> {
   return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 }
 
-// Per-process global cap only: client IP headers are untrusted here. Coordinate
-// shared, per-user limits with the deployment proxy and Elvin's auth integration.
-const rateLimitWindowMs = 60000;
-const maxRequestsPerWindow = 120;
-let rateLimitCount = 0;
-let rateLimitResetTime = 0;
-function checkRateLimit(): boolean {
-  const now = Date.now();
-  if (now >= rateLimitResetTime) {
-    rateLimitCount = 0;
-    rateLimitResetTime = now + rateLimitWindowMs;
-  }
-  if (rateLimitCount >= maxRequestsPerWindow) {
-    return false;
-  }
-  rateLimitCount++;
-  return true;
-}
-
 async function generateWithRetry(
   ai: GoogleGenAI,
   params: Omit<GenerateContentParameters, "model">
@@ -322,7 +304,7 @@ function isSupportedLanguage(language: unknown): language is SupportedLanguage {
 
 async function analyze(req: Request) {
   try {
-    authenticateParticipantRequest(req);
+    await authenticateParticipantRequest(req);
   } catch (error) {
     if (error instanceof ReportError) {
       const unauthorized = error.status === 401;
@@ -343,8 +325,16 @@ async function analyze(req: Request) {
     );
   }
 
-  if (!checkRateLimit()) {
-    return Response.json({ error: "Rate limit exceeded" }, { status: 429 });
+  try {
+    await enforceSharedAnalysisRateLimit();
+  } catch (error) {
+    if (error instanceof ReportError) {
+      return Response.json({ error: error.status === 429 ? "Rate limit exceeded" : "Authentication unavailable" }, {
+        status: error.status,
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
+    return Response.json({ error: "Authentication unavailable" }, { status: 503, headers: { "Cache-Control": "no-store" } });
   }
 
   let rawText: string;

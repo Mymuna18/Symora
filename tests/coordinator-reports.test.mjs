@@ -153,7 +153,7 @@ test("unconfigured authentication and unexpected failures do not call database",
 test("actual Next route wiring uses coordinator auth and a mocked database, with no runtime export", async () => {
   const hooks = registerHooks({
     resolve(specifier, context, nextResolve) {
-      if (specifier.endsWith("/lib/db.mjs")) {
+      if (specifier === "./db.mjs" || specifier.endsWith("/lib/db.mjs")) {
         return { url: "data:text/javascript,export const getPool = () => ({query: async () => ({rows: []})});", shortCircuit: true };
       }
       return nextResolve(specifier, context);

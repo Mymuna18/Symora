@@ -1,9 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, scryptSync } from "node:crypto";
-import { createBrowserAuth, createBrowserState, readBrowserConfig, browserAuth } from "../lib/browser-auth.mjs";
-import { createBrowserAuthHandlers } from "../lib/browser-auth-http.mjs";
-import { authenticateParticipantRequest, authenticateCoordinatorRequest, withPrivateResponse } from "../lib/request-auth.mjs";
+import { registerHooks } from "node:module";
+import { createBrowserAuth } from "../lib/browser-auth.mjs";
+import { readBrowserConfig } from "../lib/browser-auth.mjs";
+
+const mockDatabase = `export const getPool = () => globalThis.__browserAuthRuntimePool;`;
+registerHooks({ resolve(specifier, context, nextResolve) {
+  if (specifier === "./db.mjs" || specifier.endsWith("/lib/db.mjs")) return {
+    shortCircuit: true, url: `data:text/javascript,${encodeURIComponent(mockDatabase)}`,
+  };
+  return nextResolve(specifier, context);
+} });
+
+const { createBrowserAuthHandlers } = await import("../lib/browser-auth-http.mjs");
+const { authenticateParticipantRequest, authenticateCoordinatorRequest, withPrivateResponse } = await import("../lib/request-auth.mjs");
+const { browserAuth } = await import("../lib/browser-auth-runtime.mjs");
 
 // Public, synthetic test material only. Tests run with an empty environment.
 const password = "synthetic-browser-password";
@@ -23,11 +35,71 @@ function accounts() {
   ];
 }
 function config() { return { origin, key, accounts: accounts(), production: false, cookieName: "symora_session" }; }
+function createTestStore(state = { sessions: new Map(), attempts: new Map() }, now = () => Date.now()) {
+  return {
+    state,
+    async findSession(hash) {
+      const session = state.sessions.get(hash);
+      return session && session.expires > now() ? { ...session } : null;
+    },
+    async replaceSession(previous, session) {
+      if (previous) state.sessions.delete(previous);
+      state.sessions.set(session.sessionIdHash, {
+        accountKeyHash: session.accountKeyHash, role: session.role,
+        configFingerprint: session.configFingerprint, expires: session.expires,
+      });
+    },
+    async deleteSession(hash) { state.sessions.delete(hash); },
+    async cleanupExpired() {
+      for (const [hash, session] of state.sessions) if (session.expires <= now()) state.sessions.delete(hash);
+      for (const [key, bucket] of state.attempts) if (bucket.expires <= now()) state.attempts.delete(key);
+    },
+    async consumeRateLimit(scope, bucketHash, max, windowMs) {
+      const key = `${scope}:${bucketHash}`;
+      let bucket = state.attempts.get(key);
+      if (!bucket || bucket.expires <= now()) bucket = { attempts: 0, expires: now() + windowMs };
+      bucket.attempts = Math.min(bucket.attempts + 1, max + 1);
+      state.attempts.set(key, bucket);
+      return { attempts: bucket.attempts, expiresAt: bucket.expires };
+    },
+  };
+}
+const runtimeStore = createTestStore();
+globalThis.__browserAuthRuntimePool = {
+  async query(sql, values = []) {
+    if (sql.includes("FROM browser_auth_sessions") && sql.includes("SELECT account_key_hash")) {
+      const row = runtimeStore.state.sessions.get(values[0]);
+      return { rows: row && row.expires > Date.now() ? [{
+        account_key_hash: row.accountKeyHash, role: row.role,
+        config_fingerprint: row.configFingerprint, expires_ms: String(row.expires),
+      }] : [] };
+    }
+    if (sql.includes("INSERT INTO rate_limit_buckets")) return { rows: [{ attempts: 1, expires_at: new Date(Date.now() + 60_000) }] };
+    if (sql.includes("DELETE FROM browser_auth_sessions")) {
+      runtimeStore.state.sessions.delete(values[0]);
+    }
+    return { rows: [] };
+  },
+  async connect() {
+    return {
+      async query(sql, values = []) {
+        if (sql.includes("INSERT INTO browser_auth_sessions")) runtimeStore.state.sessions.set(values[0], {
+          accountKeyHash: values[1], role: values[2], configFingerprint: values[3],
+          expires: new Date(values[5]).getTime(),
+        });
+        if (sql.includes("DELETE FROM browser_auth_sessions")) runtimeStore.state.sessions.delete(values[0]);
+        return { rows: [] };
+      },
+      release() {},
+    };
+  },
+};
 function fixture() {
   let clock = now;
-  const state = createBrowserState();
+  const state = { sessions: new Map(), attempts: new Map(), pending: { value: 0 } };
   const configuration = config();
-  const auth = createBrowserAuth({ state, now: () => clock, readConfig: () => configuration });
+  const auth = createBrowserAuth({ store: createTestStore(state, () => clock), pending: state.pending,
+    now: () => clock, readConfig: () => configuration });
   return { auth, state, configuration, advance: (ms) => { clock += ms; } };
 }
 function request({ body = { username: "fictional-participant", password }, headers = {}, method = "POST", raw } = {}) {
@@ -100,7 +172,7 @@ for (const role of ["participant", "coordinator"]) {
     assert.match(result.cookie, /^symora_session=/);
     assert.match(result.cookie, /; Path=\/; HttpOnly; SameSite=Lax; Max-Age=3600$/);
     assert.doesNotMatch(result.cookie, /Domain=|; Secure/);
-    assert.equal(auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(result) } }), role), role === "participant" ? participantId : coordinatorId);
+    assert.equal(await auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(result) } }), role), role === "participant" ? participantId : coordinatorId);
     assert.deepEqual(result.body, { authenticated: true, user: { role, username: `fictional-${role}` }, expiresAt: "2026-10-11T13:00:00.000Z" });
     assert.equal(JSON.stringify(result.body).includes(passwordHash), false);
     assert.equal(JSON.stringify(result.body).includes(participantId), false);
@@ -109,7 +181,7 @@ for (const role of ["participant", "coordinator"]) {
 
 test("production login uses a Secure host-only HttpOnly session cookie", async () => {
   await withEnvironment({ NODE_ENV: "production", SYMORA_BROWSER_AUTH_ORIGIN: "https://symora.example" }, async () => {
-    const auth = createBrowserAuth({ state: createBrowserState(), now: () => now });
+    const auth = createBrowserAuth({ store: createTestStore(), now: () => now });
     const result = await auth.login(request({ headers: { origin: "https://symora.example" } }), "participant");
     assert.match(result.cookie, /^__Host-symora_session=/);
     assert.match(result.cookie, /; Path=\/; HttpOnly; SameSite=Lax; Max-Age=3600; Secure$/);
@@ -175,17 +247,17 @@ test("login fails CSRF checks for absent/wrong Origin, absent header, and a cros
   }
 });
 
-test("anonymous requests have no session and cannot access either protected role", () => {
+test("anonymous requests have no session and cannot access either protected role", async () => {
   const { auth } = fixture();
-  assert.deepEqual(auth.status(request({ method: "GET" })), { authenticated: false });
-  for (const role of ["participant", "coordinator"]) assert.throws(() => auth.authenticate(request({ method: "GET" }), role), errorIs(401, "UNAUTHORIZED"));
+  assert.deepEqual(await auth.status(request({ method: "GET" })), { authenticated: false });
+  for (const role of ["participant", "coordinator"]) await assert.rejects(auth.authenticate(request({ method: "GET" }), role), errorIs(401, "UNAUTHORIZED"));
 });
 
 test("sessions cannot cross participant/coordinator role boundaries", async () => {
   for (const role of ["participant", "coordinator"]) {
     const { auth } = fixture();
     const result = await auth.login(request({ body: { username: `fictional-${role}`, password } }), role);
-    assert.throws(() => auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(result) } }), role === "participant" ? "coordinator" : "participant"), errorIs(403, "FORBIDDEN"));
+    await assert.rejects(auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(result) } }), role === "participant" ? "coordinator" : "participant"), errorIs(403, "FORBIDDEN"));
   }
 });
 
@@ -193,14 +265,14 @@ test("cookie-authenticated writes require CSRF proof while GET works without Ori
   const { auth } = fixture();
   const result = await auth.login(request(), "participant");
   const cookie = cookieHeader(result);
-  assert.equal(auth.authenticate(new Request(`${origin}/api/reports`, { headers: { cookie } }), "participant"), participantId);
+  assert.equal(await auth.authenticate(new Request(`${origin}/api/reports`, { headers: { cookie } }), "participant"), participantId);
   for (const headers of [
     { cookie }, { cookie, origin }, { cookie, origin: "https://other.example", "x-symora-csrf": "1" },
     { cookie, origin, "x-symora-csrf": "1", "sec-fetch-site": "cross-site" },
   ]) {
-    assert.throws(() => auth.authenticate(new Request(`${origin}/api/reports`, { method: "POST", headers }), "participant"), errorIs(403, "CSRF_REJECTED"));
+    await assert.rejects(auth.authenticate(new Request(`${origin}/api/reports`, { method: "POST", headers }), "participant"), errorIs(403, "CSRF_REJECTED"));
   }
-  assert.equal(auth.authenticate(request({ headers: { cookie } }), "participant"), participantId);
+  assert.equal(await auth.authenticate(request({ headers: { cookie } }), "participant"), participantId);
 });
 
 test("session expiry is enforced server-side and capped at the configured account expiry", async () => {
@@ -210,8 +282,8 @@ test("session expiry is enforced server-side and capped at the configured accoun
   assert.match(result.cookie, /Max-Age=30$/);
   advance(30_000);
   const req = request({ method: "GET", headers: { cookie: cookieHeader(result) } });
-  assert.deepEqual(auth.status(req), { authenticated: false });
-  assert.throws(() => auth.authenticate(req, "participant"), errorIs(401, "UNAUTHORIZED"));
+  assert.deepEqual(await auth.status(req), { authenticated: false });
+  await assert.rejects(auth.authenticate(req, "participant"), errorIs(401, "UNAUTHORIZED"));
 });
 
 test("tampered session ID, expiry, signature, and duplicate session cookies are rejected", async () => {
@@ -227,7 +299,7 @@ test("tampered session ID, expiry, signature, and duplicate session cookies are 
     `symora_session=${id}.${expiry}.${flip(signature)}`,
     `${cookie}; ${cookie}`, `symora_session=invalid`,
   ]) {
-    assert.throws(() => auth.authenticate(request({ method: "GET", headers: { cookie: invalid } }), "participant"), errorIs(401, "UNAUTHORIZED"));
+    await assert.rejects(auth.authenticate(request({ method: "GET", headers: { cookie: invalid } }), "participant"), errorIs(401, "UNAUTHORIZED"));
   }
 });
 
@@ -243,7 +315,7 @@ test("server configuration edits, account removal, and key rotation revoke exist
     const { auth, configuration } = fixture();
     const result = await auth.login(request(), "participant");
     edit(configuration);
-    assert.throws(() => auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(result) } }), "participant"), errorIs(401, "UNAUTHORIZED"));
+    await assert.rejects(auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(result) } }), "participant"), errorIs(401, "UNAUTHORIZED"));
   }
 });
 
@@ -251,10 +323,10 @@ test("logout requires CSRF, clears the cookie, and invalidates replay server-sid
   const { auth } = fixture();
   const result = await auth.login(request(), "participant");
   const cookie = cookieHeader(result);
-  assert.throws(() => auth.logout(new Request(`${origin}/api/auth/logout`, { method: "POST", headers: { cookie } })), errorIs(403, "CSRF_REJECTED"));
-  assert.equal(auth.authenticate(request({ method: "GET", headers: { cookie } }), "participant"), participantId);
-  assert.equal(auth.logout(request({ headers: { cookie } })), "symora_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
-  assert.throws(() => auth.authenticate(request({ method: "GET", headers: { cookie } }), "participant"), errorIs(401, "UNAUTHORIZED"));
+  await assert.rejects(auth.logout(new Request(`${origin}/api/auth/logout`, { method: "POST", headers: { cookie } })), errorIs(403, "CSRF_REJECTED"));
+  assert.equal(await auth.authenticate(request({ method: "GET", headers: { cookie } }), "participant"), participantId);
+  assert.equal(await auth.logout(request({ headers: { cookie } })), "symora_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+  await assert.rejects(auth.authenticate(request({ method: "GET", headers: { cookie } }), "participant"), errorIs(401, "UNAUTHORIZED"));
 });
 
 test("successful login rotates an existing session and invalidates the old cookie", async () => {
@@ -262,23 +334,63 @@ test("successful login rotates an existing session and invalidates the old cooki
   const first = await auth.login(request(), "participant");
   const second = await auth.login(request({ headers: { cookie: cookieHeader(first) } }), "participant");
   assert.notEqual(cookieHeader(first), cookieHeader(second));
-  assert.throws(() => auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(first) } }), "participant"), errorIs(401, "UNAUTHORIZED"));
-  assert.equal(auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(second) } }), "participant"), participantId);
+  await assert.rejects(auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(first) } }), "participant"), errorIs(401, "UNAUTHORIZED"));
+  assert.equal(await auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(second) } }), "participant"), participantId);
 });
 
 test("switching roles through login revokes the earlier role's session", async () => {
   const { auth } = fixture();
   const participant = await auth.login(request(), "participant");
   const coordinator = await auth.login(request({ body: { username: "fictional-coordinator", password }, headers: { cookie: cookieHeader(participant) } }), "coordinator");
-  assert.throws(() => auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(participant) } }), "participant"), errorIs(401, "UNAUTHORIZED"));
-  assert.equal(auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(coordinator) } }), "coordinator"), coordinatorId);
-  assert.throws(() => auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(coordinator) } }), "participant"), errorIs(403, "FORBIDDEN"));
+  await assert.rejects(auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(participant) } }), "participant"), errorIs(401, "UNAUTHORIZED"));
+  assert.equal(await auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(coordinator) } }), "coordinator"), coordinatorId);
+  await assert.rejects(auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(coordinator) } }), "participant"), errorIs(403, "FORBIDDEN"));
 });
 
 test("a session from a previous process is not accepted by an empty server allowlist", async () => {
   const { auth } = fixture();
   const result = await auth.login(request(), "participant");
-  assert.throws(() => fixture().auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(result) } }), "participant"), errorIs(401, "UNAUTHORIZED"));
+  await assert.rejects(fixture().auth.authenticate(request({ method: "GET", headers: { cookie: cookieHeader(result) } }), "participant"), errorIs(401, "UNAUTHORIZED"));
+});
+
+test("session revocation and login limits are shared across auth instances", async () => {
+  const state = { sessions: new Map(), attempts: new Map() };
+  const store = createTestStore(state, () => now);
+  const first = createBrowserAuth({ store, now: () => now, readConfig: config });
+  const second = createBrowserAuth({ store, now: () => now, readConfig: config });
+  const result = await first.login(request(), "participant");
+  const cookie = cookieHeader(result);
+  assert.equal(await second.authenticate(request({ method: "GET", headers: { cookie } }), "participant"), participantId);
+  await second.logout(request({ headers: { cookie } }));
+  await assert.rejects(first.authenticate(request({ method: "GET", headers: { cookie } }), "participant"), errorIs(401, "UNAUTHORIZED"));
+
+  const rateState = { sessions: new Map(), attempts: new Map() };
+  const rateStore = createTestStore(rateState, () => now);
+  const authInstances = [
+    createBrowserAuth({ store: rateStore, now: () => now, readConfig: config }),
+    createBrowserAuth({ store: rateStore, now: () => now, readConfig: config }),
+  ];
+  for (let index = 0; index < 5; index++) {
+    await assert.rejects(authInstances[index % 2].login(request({
+      body: { username: "fictional-participant", password: "incorrect" },
+    }), "participant"), errorIs(401, "INVALID_CREDENTIALS"));
+  }
+  await assert.rejects(authInstances[1].login(request(), "participant"), errorIs(429, "LOGIN_RATE_LIMITED"));
+});
+
+test("browser sessions and login fail closed when PostgreSQL is unavailable", async () => {
+  const { auth } = fixture();
+  const result = await auth.login(request(), "participant");
+  const cookie = cookieHeader(result);
+  const unavailableStore = {
+    ...createTestStore(),
+    async findSession() { throw new Error("synthetic PostgreSQL outage"); },
+    async consumeRateLimit() { throw new Error("synthetic PostgreSQL outage"); },
+  };
+  const authWithUnavailableStore = createBrowserAuth({ store: unavailableStore, now: () => now, readConfig: config });
+  await assert.rejects(authWithUnavailableStore.login(request(), "participant"), errorIs(503, "BROWSER_AUTH_UNAVAILABLE"));
+  await assert.rejects(authWithUnavailableStore.authenticate(request({ method: "GET", headers: { cookie } }), "participant"), errorIs(503, "BROWSER_AUTH_UNAVAILABLE"));
+  await assert.rejects(authWithUnavailableStore.logout(request({ headers: { cookie } })), errorIs(503, "BROWSER_AUTH_UNAVAILABLE"));
 });
 
 test("login rate limits cannot be bypassed by changing forwarded headers", async () => {
@@ -305,15 +417,15 @@ test("global request and concurrent password-hash limits bound login work", asyn
   for (let i = 0; i < 30; i++) await assert.rejects(first.auth.login(request({ body: {} }), "participant"), errorIs(400, "INVALID_LOGIN"));
   await assert.rejects(first.auth.login(request(), "participant"), errorIs(429, "LOGIN_RATE_LIMITED"));
   const second = fixture();
-  second.state.pending = 4;
+  second.state.pending.value = 4;
   await assert.rejects(second.auth.login(request(), "participant"), errorIs(429, "LOGIN_RATE_LIMITED"));
   assert.equal(second.state.sessions.size, 0);
 });
 
 test("a configuration change during password verification prevents session creation", async () => {
-  const state = createBrowserState();
+  const state = { sessions: new Map(), attempts: new Map() };
   let reads = 0;
-  const auth = createBrowserAuth({ state, now: () => now, readConfig: () => {
+  const auth = createBrowserAuth({ store: createTestStore(state, () => now), now: () => now, readConfig: () => {
     const cfg = config();
     if (++reads > 1) cfg.key = Buffer.alloc(32, 8).toString("base64url");
     return cfg;
@@ -322,7 +434,7 @@ test("a configuration change during password verification prevents session creat
   assert.equal(state.sessions.size, 0);
 });
 
-test("explicit invalid bearer credentials never fall back to a valid browser cookie", async () => {
+test.skip("explicit invalid bearer credentials never fall back to a valid browser cookie", async () => {
   const validToken = "synthetic_bearer_token_".padEnd(43, "x");
   const tokenSha256 = createHash("sha256").update(validToken).digest("hex");
   await withEnvironment({
@@ -340,6 +452,31 @@ test("explicit invalid bearer credentials never fall back to a valid browser coo
       browserAuth.logout(request({ headers: { cookie } }));
     }
   });
+
+});
+
+test("bearer auth remains compatible and an invalid explicit bearer never falls back to a session", async () => {
+    const validToken = "synthetic-bearer-token".padEnd(43, "x");
+    const tokenSha256 = createHash("sha256").update(validToken).digest("hex");
+    await withEnvironment({
+      SYMORA_DEMO_AUTH_ENABLED: "true",
+      SYMORA_DEMO_PARTICIPANTS: JSON.stringify([{ participantId, tokenSha256, expiresAt }]),
+      SYMORA_COORDINATOR_AUTH_ENABLED: "true",
+      SYMORA_COORDINATORS: JSON.stringify([{ coordinatorId, tokenSha256, expiresAt }]),
+    }, async () => {
+      runtimeStore.state.sessions.clear();
+      runtimeStore.state.attempts.clear();
+      const result = await browserAuth.login(request(), "participant");
+      const cookie = cookieHeader(result);
+      assert.equal(await authenticateParticipantRequest(request({ method: "GET", headers: { cookie } })), participantId);
+      await assert.rejects(authenticateParticipantRequest(request({
+        method: "GET", headers: { cookie, authorization: "not-a-valid-bearer" },
+      })), errorIs(401, "UNAUTHORIZED"));
+      assert.equal(await authenticateParticipantRequest(request({
+        headers: { authorization: `Bearer ${validToken}` },
+      })), participantId);
+      await browserAuth.logout(request({ headers: { cookie } }));
+    });
 });
 
 function assertPrivate(response) {
@@ -390,7 +527,7 @@ test("auth handlers sanitize unexpected failures and attach private headers to e
 
 test("rate-limited HTTP responses include a retry delay without setting a session", async () => {
   const { auth, state } = fixture();
-  state.pending = 4;
+  state.pending.value = 4;
   const response = await createBrowserAuthHandlers(auth).participantLogin(request());
   assert.equal(response.status, 429);
   assertPrivate(response);
@@ -400,14 +537,14 @@ test("rate-limited HTTP responses include a retry delay without setting a sessio
 
 test("disabled browser configuration fails closed for login, session, and protected access", async () => {
   await withEnvironment({ SYMORA_BROWSER_AUTH_ENABLED: undefined }, async () => {
-    const auth = createBrowserAuth({ state: createBrowserState() });
+    const auth = createBrowserAuth({ store: createTestStore() });
     const handlers = createBrowserAuthHandlers(auth);
     for (const response of [await handlers.participantLogin(request()), await handlers.session(request({ method: "GET" }))]) {
       assert.equal(response.status, 503);
       assertPrivate(response);
       assert.equal((await response.json()).error.code, "BROWSER_AUTH_UNAVAILABLE");
     }
-    assert.throws(() => auth.authenticate(request({ method: "GET" }), "coordinator"), errorIs(503, "BROWSER_AUTH_UNAVAILABLE"));
+    await assert.rejects(auth.authenticate(request({ method: "GET" }), "coordinator"), errorIs(503, "BROWSER_AUTH_UNAVAILABLE"));
   });
 });
 
