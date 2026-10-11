@@ -9,9 +9,15 @@ import {
   logoutBrowserSession,
 } from "@/lib/frontend-api";
 import {
+  updateCoordinatorReportStatus,
+  type ReviewStatusInput,
+} from "@/lib/coordinator-review-api";
+import {
+  appendChatMessage,
   dailyChatKey,
   readChatMessages,
   subscribeToChatMessages,
+  writeFollowUpState,
   type ChatMessage,
 } from "@/lib/chat";
 import { StatusBadge } from "@/components/ui/StatusBadge";
@@ -27,6 +33,10 @@ const langName = {
   zh: "Mandarin Chinese",
   vi: "Vietnamese",
 } as const;
+// The server requires a nonempty note for follow-ups. Coordinators don't type
+// one, so this fixed note is sent and stored in the review history.
+const FOLLOW_UP_NOTE = "Follow-up requested by the study team.";
+
 // Fictional placeholders (not saved anywhere yet)
 const coordinators = ["Unassigned", "Coordinator A", "Coordinator B"];
 
@@ -54,6 +64,48 @@ const glass = "border border-white/60 bg-white/40 shadow-lg backdrop-blur-md";
 const th =
   "w-44 border border-forest-800/25 bg-sage/70 px-3 py-2 text-sm font-semibold text-forest-800";
 const td = "border border-forest-800/25 px-3 py-2";
+
+// Demo notification: written to this browser's chat store, which the participant
+// page reads (same browser only). The participant page shows the translated text
+// based on `kind`; `text` is the English fallback.
+function notifyParticipant(
+  participantCode: string,
+  status: "reviewed" | "follow_up_requested",
+) {
+  try {
+    const day = new Date().toLocaleDateString("en-CA");
+    const key = dailyChatKey(participantCode, day);
+    const time = new Date().toLocaleTimeString("en-US", { timeStyle: "short" });
+    if (status === "reviewed") {
+      appendChatMessage(key, {
+        from: "doctor",
+        text: "Your doctor has reviewed your symptom report. Thank you for sharing how you are feeling.",
+        kind: "reviewed",
+        auto: true,
+        time,
+        readByPatient: false,
+      });
+      return;
+    }
+    appendChatMessage(key, {
+      from: "doctor",
+      text: "Your doctor would like to follow up with you about your report. Please contact your doctor to schedule an appointment. If it is an emergency, call 911.",
+      kind: "follow_up_requested",
+      auto: true,
+      time,
+      readByPatient: false,
+    });
+    // Daily reminders start tomorrow; today's first message already counts.
+    writeFollowUpState(participantCode, {
+      pending: true,
+      appointmentScheduled: false,
+      lastReminderDate: day,
+    });
+  } catch {
+    // The server update already succeeded; a browser-storage problem must not
+    // be reported as a failed review.
+  }
+}
 
 function fmtDate(iso: string) {
   return new Date(iso).toLocaleDateString("en-US", { dateStyle: "medium" });
@@ -132,6 +184,9 @@ export default function DashboardPage() {
   const [nextOffset, setNextOffset] = useState<number | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
   const [logoutBusy, setLogoutBusy] = useState(false);
+  const [busyAction, setBusyAction] = useState<ReviewStatusInput["workflowStatus"] | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const statusBusy = busyAction !== null;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -211,8 +266,22 @@ export default function DashboardPage() {
   const selected = filtered.find((r) => r.id === selectedId) ?? filtered[0] ?? null;
   const needsReview = reports.filter((r) => r.workflowStatus === "submitted").length;
 
+  // Allowed moves, matching the server: submitted -> reviewed / follow-up,
+  // reviewed -> follow-up. Follow-up requested and closed cannot change.
+  const canMarkReviewed = selected?.workflowStatus === "submitted";
+  const canRequestFollowUp =
+    selected?.workflowStatus === "submitted" || selected?.workflowStatus === "reviewed";
+
   // One chat per participant per day.
   const chatKey = selected && today ? dailyChatKey(selected.participantCode, today) : "";
+
+  // Clear any action error whenever a different report is shown.
+  const selectedReportId = selected?.id ?? "";
+  useEffect(() => {
+    startTransition(() => {
+      setActionError(null);
+    });
+  }, [selectedReportId]);
 
   async function loadMoreReports() {
     if (nextOffset === null || loadingMore) return;
@@ -244,6 +313,39 @@ export default function DashboardPage() {
       }
     } finally {
       setLoadingMore(false);
+    }
+  }
+
+  async function changeStatus(input: ReviewStatusInput) {
+    if (!selected || statusBusy) return;
+    const reportId = selected.id;
+    const participantCode = selected.participantCode;
+    setBusyAction(input.workflowStatus);
+    setActionError(null);
+    try {
+      const result = await updateCoordinatorReportStatus(reportId, input);
+      // Use the status the server confirmed, not the one we asked for.
+      setReports((current) =>
+        current.map((report) =>
+          report.id === reportId
+            ? { ...report, workflowStatus: result.report.workflowStatus }
+            : report,
+        ),
+      );
+      notifyParticipant(participantCode, result.report.workflowStatus as "reviewed" | "follow_up_requested");
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        setReports([]);
+        setSelectedId("");
+        setMessages([]);
+        router.replace("/coordinator-login?session=expired");
+        return;
+      }
+      setActionError(
+        error instanceof Error ? error.message : "The review update could not be completed.",
+      );
+    } finally {
+      setBusyAction(null);
     }
   }
 
@@ -431,6 +533,7 @@ export default function DashboardPage() {
                   {filtered.map((r) => (
                     <li key={r.id}>
                       <button
+                        type="button"
                         onClick={() => setSelectedId(r.id)}
                         aria-current={selected?.id === r.id}
                         className={`w-full rounded-2xl border-l-8 bg-white/80 p-3 text-left text-ink shadow-sm transition-all duration-300 ease-out hover:-translate-y-0.5 hover:shadow-lg hover:ring-2 hover:ring-glow/70 ${
@@ -606,18 +709,47 @@ export default function DashboardPage() {
                     <button
                       className={actionBtn}
                       type="button"
-                      disabled
-                      title="The coordinator reports API is read-only."
+                      onClick={() =>
+                        void changeStatus({
+                          workflowStatus: "follow_up_requested",
+                          reviewNote: FOLLOW_UP_NOTE,
+                        })
+                      }
+                      disabled={!canRequestFollowUp || statusBusy}
+                      title={
+                        canRequestFollowUp
+                          ? undefined
+                          : "A follow-up has already been requested or the report is closed."
+                      }
                     >
-                      Request follow-up
+                      {busyAction === "follow_up_requested" ? "Saving…" : "Request follow-up"}
                     </button>
-                    <button className={actionBtn} type="button" disabled title="The coordinator reports API is read-only.">
-                      Mark reviewed
+                    <button
+                      className={actionBtn}
+                      type="button"
+                      onClick={() => void changeStatus({ workflowStatus: "reviewed" })}
+                      disabled={!canMarkReviewed || statusBusy}
+                      title={
+                        canMarkReviewed
+                          ? undefined
+                          : "Only reports that are still submitted can be marked reviewed."
+                      }
+                    >
+                      {busyAction === "reviewed" ? "Saving…" : "Mark reviewed"}
                     </button>
-                    <button className={actionBtn} onClick={() => window.print()}>
+                    <button className={actionBtn} type="button" onClick={() => window.print()}>
                       Print / Save PDF
                     </button>
                   </div>
+
+                  {actionError && (
+                    <p
+                      role="alert"
+                      className="rounded-2xl border border-red-800/20 bg-red-50 p-3 text-sm text-red-900 print:hidden"
+                    >
+                      {actionError}
+                    </p>
+                  )}
 
                   {/* Chat: fills the remaining space */}
                   <section

@@ -1,7 +1,6 @@
 "use client";
 
 import { BrandHeader } from "@/components/ui/BrandHeader";
-import { SignOutButton } from "@/components/ui/SignOutButton";
 import { startTransition, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
@@ -1023,12 +1022,6 @@ export default function ReportPage() {
             <section className="flex flex-col gap-6">
               <h1 className="text-3xl font-bold text-forest-800">{L.profileTitle}</h1>
               <fieldset>
-                <hr className="border-t border-forest-800/20" />
-                  <SignOutButton 
-                    label={L.signOut} 
-                    busyLabel={L.signingOut} 
-                    errorLabel={L.signOutError} 
-                  />
                 <legend className="mb-2 text-lg font-medium text-forest-800">{L.language}</legend>
                 <div className="flex flex-col gap-3">
                   {langOptions.map((o) => (
@@ -1048,6 +1041,7 @@ export default function ReportPage() {
                   ))}
                 </div>
               </fieldset>
+              <hr className="border-t border-forest-800/20" />
               {reportError && <p role="alert" className="text-sm text-red-900">{reportError}</p>}
               <button
                 type="button"
