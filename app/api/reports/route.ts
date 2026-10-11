@@ -3,7 +3,6 @@ import { authenticateDemoParticipant } from "../../../lib/demo-auth.mjs";
 import { createReportHandler } from "../../../lib/report-http.mjs";
 import { saveReport } from "../../../lib/report-store.mjs";
 
-export const runtime = "nodejs";
 
 export const POST = createReportHandler({
   authenticate: authenticateDemoParticipant,
